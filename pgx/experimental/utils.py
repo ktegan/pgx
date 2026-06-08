@@ -13,4 +13,8 @@ def act_randomly(rng: PRNGKey, legal_action_mask: Array) -> Array:
         "Note that codes under pgx.experimental are subject to change without notice."
     )
     logits = jnp.log(legal_action_mask.astype(jnp.float32))
+    if len(logits.shape) == 1:
+        # when playing one game at a time (see test_api_single()) logits is only
+        # 1D and JAX doesn't like us referring to axis dimension 1 which doesn't exist
+        return jax.random.categorical(rng, logits=logits)
     return jax.random.categorical(rng, logits=logits, axis=1)
