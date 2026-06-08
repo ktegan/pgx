@@ -106,6 +106,19 @@ class State(abc.ABC):
     legal_action_mask: Array
     _step_count: Array
 
+
+    def get_chance_logits(self) -> Array:
+        """
+        Return -INF values if this is not a chance state.
+
+        TODO add chance_logits as a member variable instead of using this method.
+        Adding a member variable unfortunately would require adding the same member
+        variable to all game states.  Most games do not have any stochastic element
+        fill in the default -INF value here.
+        """
+        return jnp.full(self.current_player.shape, -jnp.inf, dtype=jnp.float32)
+
+
     @property
     @abc.abstractmethod
     def env_id(self) -> EnvId:

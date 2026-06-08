@@ -95,6 +95,11 @@ def recurrent_fn(model, rng_key: jnp.ndarray, action: jnp.ndarray, state: pgx.St
     logits = logits - jnp.max(logits, axis=-1, keepdims=True)
     logits = jnp.where(state.legal_action_mask, logits, jnp.finfo(logits.dtype).min)
 
+    # where chance logits are available (chance_logits are not -INF) use those instead
+    chance_logits = state.get_chance_logits()
+    is_chance_node = ~jnp.isneginf(chance_logits)
+    logits = jnp.where(is_chance_node, chance_logits, logits)
+
     reward = state.rewards[jnp.arange(state.rewards.shape[0]), current_player]
     value = jnp.where(state.terminated, 0.0, value)
     discount = -1.0 * jnp.ones_like(value)
@@ -115,6 +120,7 @@ class SelfplayOutput(NamedTuple):
     terminated: jnp.ndarray
     action_weights: jnp.ndarray
     discount: jnp.ndarray
+    is_chance_node: jnp.ndarray
 
 
 @jax.pmap
@@ -146,12 +152,15 @@ def selfplay(model, rng_key: jnp.ndarray) -> SelfplayOutput:
         state = jax.vmap(auto_reset(env.step, env.init))(state, policy_output.action, keys)
         discount = -1.0 * jnp.ones_like(value)
         discount = jnp.where(state.terminated, 0.0, discount)
+
+        is_chance_node = ~jnp.isneginf(state.get_chance_logits())
         return state, SelfplayOutput(
             obs=observation,
             action_weights=policy_output.action_weights,
             reward=state.rewards[jnp.arange(state.rewards.shape[0]), actor],
             terminated=state.terminated,
             discount=discount,
+            is_chance_node=is_chance_node,
         )
 
     # Run selfplay for max_num_steps by batch
@@ -169,6 +178,8 @@ class Sample(NamedTuple):
     policy_tgt: jnp.ndarray
     value_tgt: jnp.ndarray
     mask: jnp.ndarray
+    is_chance_node: jnp.ndarray
+
 
 
 @jax.pmap
@@ -191,11 +202,14 @@ def compute_loss_input(data: SelfplayOutput) -> Sample:
     )
     value_tgt = value_tgt[::-1, :]
 
+    masked_weights = jnp.where(data.is_chance_node, 0.0, data.action_weights)
+
     return Sample(
         obs=data.obs,
-        policy_tgt=data.action_weights,
+        policy_tgt=masked_weights,
         value_tgt=value_tgt,
         mask=value_mask,
+        is_chance_node=data.is_chance_node,
     )
 
 
@@ -205,6 +219,7 @@ def loss_fn(model_params, model_state, samples: Sample):
     )
 
     policy_loss = optax.softmax_cross_entropy(logits, samples.policy_tgt)
+    policy_loss = jnp.where(samples.is_chance_node, 0.0, policy_loss)  # do not count chance nodes in policy loss
     policy_loss = jnp.mean(policy_loss)
 
     value_loss = optax.l2_loss(value, samples.value_tgt)

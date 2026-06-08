@@ -25,6 +25,10 @@ from pgx._src.types import Array, PRNGKey
 TRUE = jnp.bool_(True)
 FALSE = jnp.bool_(False)
 
+# index 0 for non-double rolls, index 1 for double rolls
+ROLL_PROBABILITY = jnp.array([2.0 / 36.0, 1.0 / 36.0], dtype=jnp.float32)
+ROLL_LOGITS = jnp.log(ROLL_PROBABILITY)
+
 
 @dataclass
 class State(core.State):
@@ -47,6 +51,14 @@ class State(core.State):
     @property
     def env_id(self) -> core.EnvId:
         return "backgammon"
+
+    def get_chance_logits(self) -> Array:
+        """ returned array must be the same dimension as action """
+        is_first_roll = self._played_dice_num != 0
+        is_double = (self._dice[..., 0] == self._dice[..., 1]).astype(jnp.int32)
+        dice_logits = ROLL_LOGITS[is_double]
+
+        return jnp.where(is_first_roll, jnp.full(self.current_player.shape, -jnp.inf, dtype=jnp.float32), dice_logits)
 
 
 class Backgammon(core.Env):
