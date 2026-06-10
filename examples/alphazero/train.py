@@ -87,22 +87,19 @@ def recurrent_fn(model, rng_key: jnp.ndarray, action: jnp.ndarray, state: pgx.St
     del rng_key
     model_params, model_state = model
 
-    current_player = state.current_player
+    previous_player = state.current_player
     state = jax.vmap(env.step)(state, action)
+    current_player = state.current_player
 
     (logits, value), _ = forward.apply(model_params, model_state, state.observation, is_eval=True)
     # mask invalid actions
     logits = logits - jnp.max(logits, axis=-1, keepdims=True)
     logits = jnp.where(state.legal_action_mask, logits, jnp.finfo(logits.dtype).min)
-
-    # where chance logits are available (chance_logits are not -INF) use those instead
-    chance_logits = state.get_chance_logits()
-    is_chance_node = ~jnp.isneginf(chance_logits)
-    logits = jnp.where(is_chance_node, chance_logits, logits)
+    logits = state.get_normal_or_chance_logits(logits)
 
     reward = state.rewards[jnp.arange(state.rewards.shape[0]), current_player]
     value = jnp.where(state.terminated, 0.0, value)
-    discount = -1.0 * jnp.ones_like(value)
+    discount = jnp.where(previous_player == current_player, 1.0, -1.0) * jnp.ones_like(value)
     discount = jnp.where(state.terminated, 0.0, discount)
 
     recurrent_fn_output = mctx.RecurrentFnOutput(
@@ -135,6 +132,11 @@ def selfplay(model, rng_key: jnp.ndarray) -> SelfplayOutput:
         (logits, value), _ = forward.apply(
             model_params, model_state, state.observation, is_eval=True
         )
+        # if chance logits are available (meaning upcoming action is stochastic) use those instead
+        chance_logits = state.get_chance_logits()
+        is_chance_node = state.has_chance_logits(chance_logits)
+        logits = state.get_normal_or_chance_logits(logits, chance_logits)
+
         root = mctx.RootFnOutput(prior_logits=logits, value=value, embedding=state)
 
         policy_output = mctx.gumbel_muzero_policy(
@@ -149,11 +151,11 @@ def selfplay(model, rng_key: jnp.ndarray) -> SelfplayOutput:
         )
         actor = state.current_player
         keys = jax.random.split(key2, batch_size)
+        previous_player = state.current_player
         state = jax.vmap(auto_reset(env.step, env.init))(state, policy_output.action, keys)
-        discount = -1.0 * jnp.ones_like(value)
+        discount = jnp.where(previous_player == state.current_player, 1.0, -1.0) * jnp.ones_like(value)
         discount = jnp.where(state.terminated, 0.0, discount)
 
-        is_chance_node = ~jnp.isneginf(state.get_chance_logits())
         return state, SelfplayOutput(
             obs=observation,
             action_weights=policy_output.action_weights,

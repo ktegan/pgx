@@ -109,15 +109,28 @@ class State(abc.ABC):
 
     def get_chance_logits(self) -> Array:
         """
-        Return -INF values if this is not a chance state.
+        Return all -INF values if the following action is a normal player action.
+        If the following action is based on chance this will be overridden by the
+        subclass to return an array with values other than -INF.
 
-        TODO add chance_logits as a member variable instead of using this method.
-        Adding a member variable unfortunately would require adding the same member
-        variable to all game states.  Most games do not have any stochastic element
-        fill in the default -INF value here.
+        TODO it would require larger changes but it probably would be better to
+        add chance_logits as a member variable instead of using this method.
         """
         return jnp.full(self.current_player.shape, -jnp.inf, dtype=jnp.float32)
 
+    def has_chance_logits(self, chance_logits:Array=None) -> Array:
+        if chance_logits is None:
+            chance_logits = self.get_chance_logits()
+        return ~(jnp.isneginf(chance_logits).all(axis=-1))
+
+    def get_normal_or_chance_logits(self, logits:Array, chance_logits:Array=None) -> Array:
+        """
+        Assuming that every node is either a chance node or an action node this
+        returns chance logits if any are available, otherwise non-chance logits.
+        """
+        if chance_logits is None:
+            chance_logits = self.get_chance_logits()
+        return jnp.where(self.has_chance_logits(chance_logits), chance_logits, logits)
 
     @property
     @abc.abstractmethod
