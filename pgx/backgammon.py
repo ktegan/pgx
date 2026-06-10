@@ -374,18 +374,9 @@ def _update_playable_dice(
     action: Array,
 ) -> Array:
     _n = played_dice_num
-
-    die_idx       = _action_to_die(action) - 1
-    #die_array = jnp.array([die_idx] * MAX_MOVES, dtype=jnp.int32)
-    #dice_indices: Array = jnp.array(list(range(MAX_MOVES)), dtype=jnp.int32)
-
-    #def _update_for_diff_dice(die: Array, idx: Array, playable_dice: Array):
-    #    return (die == playable_dice[idx]) * NO_MOVE + (die != playable_dice[idx]) * playable_dice[idx]
-
-    # NOTE if we play one dice and then choose the action for the next, where in the code is the original die eliminated ?
+    die_idx = _action_to_die(action) - 1
     return ((dice[0] == dice[1]) * playable_dice.at[(MAX_MOVES - 1) - _n].set(NO_MOVE)
           + (dice[0] != dice[1]) * jnp.where(playable_dice == die_idx, NO_MOVE, playable_dice))
-          #+ (dice[0] != dice[1]) * jax.vmap(_update_for_diff_dice)(die_array, dice_indices, jnp.tile(playable_dice, (MAX_MOVES, 1))).astype(jnp.int32))
 
 
 def _home_board() -> Array:
@@ -434,14 +425,9 @@ def _exists(board: Array, point: int) -> bool:
 def _action_to_src(action: Array) -> int:
     """
     Translate src to board index.  For this function we assume that src is not set to SRC_NO_MOVE.
-        action // 6 == 0: no move
-        action // 6 == 1: move from bar
-        action // 6 >= 2: move from (action//6 - 2) board index (2 offset is SRC_BOARD_OFFSET)
-
-    Output src:
-        no move: -2 (SOURCE_BOARD_OFFSET)
-        move from bar: BAR_IDX
-        move from board: board index
+        no move,         input: action // 6 == 0, output: -2 (-SOURCE_BOARD_OFFSET)
+        move from bar,   input: action // 6 == 1, output: BAR_IDX
+        move_from board, input: action // 6 >= 2: output: board index (action//6 - 2)
     """
     src_part = action // DICE_SIDES
     return jnp.where(src_part == SRC_BAR, jnp.int32(BAR_IDX), jnp.int32(src_part - SRC_BOARD_OFFSET))  # type: ignore
@@ -458,12 +444,13 @@ def _calc_tgt(src: int, die) -> int:
     When we come in from the bar a roll of 1 translates to the first
     index on the board which is index 0, so we land on index = die - 1.
     """
-    return ((src >= BOARD_LENGTH) * (jnp.int32(die) - 1)
-          + (src <  BOARD_LENGTH) * jnp.int32(_from_board(src, die)))  # type: ignore
+    is_from_bar = src >= BOARD_LENGTH
+    return jnp.where(is_from_bar, jnp.int32(die) - 1, jnp.int32(_tgt_from_board(src, die)))  # type: ignore
 
 
-def _from_board(src: int, die: int) -> int:
-    _is_to_board = (src + die >= 0) & (src + die < BOARD_LENGTH)
+def _tgt_from_board(src: int, die: int) -> int:
+    """ If the action is a noop (where src equals -SRC_BOARD_OFFSET) we can return anything, we return OFF_IDX. """
+    _is_to_board = (src >= 0) & (src + die < BOARD_LENGTH)
     return jnp.where(_is_to_board, jnp.int32(src + die), jnp.int32(OFF_IDX))  # type: ignore
 
 
@@ -487,7 +474,7 @@ def _is_action_legal(board: Array, action: Array) -> bool:
     src, die, tgt = _decompose_action(action)
     _is_to_point = (0 <= tgt) & (tgt < BOARD_LENGTH) & (src >= 0)
     return jnp.where(_is_to_point, _is_to_point_legal(board, src, tgt),
-                                   _is_to_off_legal( board, src, tgt, die))  # type: ignore
+                                   _is_to_off_legal(board, src, tgt, die))  # type: ignore
 
 
 def _distance_to_goal(src: int) -> int:
@@ -518,8 +505,9 @@ def _is_to_point_legal(board: Array, src: int, tgt: int) -> bool:
     """
     e = _exists(board, src)
     o = _is_open(board, tgt)
-    return ((src == BAR_IDX) & e & o) | ((src < 24) & e & o & (board[BAR_IDX] == 0))  # type: ignore
-
+    nothing_on_bar = (board[BAR_IDX] == 0)
+    is_not_noop = (src >= 0)
+    return e & o & is_not_noop & ((src == BAR_IDX) | nothing_on_bar)
 
 
 def _move(board: Array, action: Array) -> Array:
@@ -566,10 +554,10 @@ def _remains_at_inner(board: Array) -> bool:
     return jnp.take(board, _home_board()).sum() != 0  # type: ignore
 
 
-def _legal_action_mask(board: Array, dice: Array) -> Array:
+def _legal_action_mask(board: Array, playable_dice: Array) -> Array:
     start_idx = SRC_NO_MOVE * DICE_SIDES
     no_op_mask = jnp.zeros(ACTION_TOTAL_LENGTH, dtype=jnp.bool_).at[start_idx:start_idx + DICE_SIDES].set(TRUE)
-    legal_actions = jax.vmap(partial(_legal_action_mask_for_single_die, board=board))(die=dice) # return 2D (SRC_LENGTH, DICE_SIDES) array
+    legal_actions = jax.vmap(partial(_legal_action_mask_for_single_die, board=board))(die=playable_dice) # return 2D (SRC_LENGTH, DICE_SIDES) array
     any_legal_actions_per_dice = legal_actions.any(axis=0)
 
     # from bkgm.com: A player must use both numbers of a roll if this is legally possible
@@ -593,15 +581,15 @@ def _legal_action_mask_for_single_die(board: Array, die: int) -> Array:
     """
     Legal action mask for a single die.
     """
-    return ((die == NO_MOVE) * jnp.zeros(ACTION_TOTAL_LENGTH, dtype=jnp.bool_)
-          + (die != NO_MOVE) * _legal_action_mask_for_valid_single_dice(board, die))
+    return jnp.where(die == NO_MOVE, jnp.zeros(ACTION_TOTAL_LENGTH, dtype=jnp.bool_),
+                                    _legal_action_mask_for_valid_single_dice(board, die))
 
 
 def _legal_action_mask_for_valid_single_dice(board: Array, die: int) -> Array:
     """
     Legal action mask for a single die when the die is valid.
     """
-    src_indices = jnp.arange(SRC_LENGTH, dtype=jnp.int32)  # calc legal action for all src indices
+    action_src_indices = jnp.arange(SRC_LENGTH, dtype=jnp.int32)  # calc legal action for all src indices
 
     def _is_legal(idx: Array):
         action = idx * DICE_SIDES + die
@@ -609,7 +597,7 @@ def _legal_action_mask_for_valid_single_dice(board: Array, die: int) -> Array:
         legal_action_mask = legal_action_mask.at[action].set(_is_action_legal(board, action))
         return legal_action_mask
 
-    legal_action_mask = jax.vmap(_is_legal)(src_indices).any(axis=0)  # map over ACTION_LENGTH elements
+    legal_action_mask = jax.vmap(_is_legal)(action_src_indices).any(axis=0)  # map over ACTION_LENGTH elements
     return legal_action_mask
 
 

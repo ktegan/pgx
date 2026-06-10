@@ -864,7 +864,6 @@ def test_distance_to_goal():
 
 
 def test_action_to_src():
-    jax.debug.print("DEBUG test_action_to_src, {ans1}, {ans2}", ans1=_action_to_src(1), ans2=_action_to_src(2))
     assert _action_to_src(0 * 6) < 0
     assert _action_to_src(1 * 6) == 24
     assert _action_to_src(2 * 6) == 0
