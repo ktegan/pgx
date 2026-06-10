@@ -5,7 +5,7 @@ from pgx.experimental.utils import act_randomly
 from pgx.backgammon import (
     State,
     _flip_board,
-    _calc_src,
+    _action_to_src,
     _calc_tgt,
     _calc_win_score,
     _change_turn,
@@ -31,7 +31,7 @@ init = jax.jit(env.init)
 step = jax.jit(env.step)
 observe = jax.jit(env.observe)
 _no_winning_step = jax.jit(_no_winning_step)
-_calc_src = jax.jit(_calc_src)
+_action_to_src = jax.jit(_action_to_src)
 _calc_tgt = jax.jit(_calc_tgt)
 _calc_win_score = jax.jit(_calc_win_score)
 _change_turn = jax.jit(_change_turn)
@@ -554,7 +554,7 @@ def make_test_state(
     dice: jnp.ndarray,
     playable_dice: jnp.ndarray,
     played_dice_num: jnp.ndarray,
-    legal_action_mask=jnp.zeros(6 * 26, dtype=jnp.bool_),
+    legal_action_mask=jnp.zeros(6 * 26 + 21, dtype=jnp.bool_),
 ):
     return State(
         current_player=current_player,
@@ -691,7 +691,7 @@ def test_step():
         legal_action_mask=legal_action_mask,
     )
     expected_legal_action_mask: jnp.ndarray = jnp.zeros(
-        6 * 26, dtype=jnp.bool_
+        6 * 26 + 21, dtype=jnp.bool_
     )
     expected_legal_action_mask = expected_legal_action_mask.at[
         6 * (1) + 0
@@ -714,7 +714,7 @@ def test_step():
     assert state._turn == 1  # turn is not changed?
     assert state._board.at[1].get() == 4 and state._board.at[24].get() == 3
     expected_legal_action_mask: jnp.ndarray = jnp.zeros(
-        6 * 26, dtype=jnp.bool_
+        6 * 26 + 21, dtype=jnp.bool_
     )
     expected_legal_action_mask = expected_legal_action_mask.at[
         6 * (1) + 0
@@ -743,7 +743,7 @@ def test_step():
         legal_action_mask=legal_action_mask,
     )
     expected_legal_action_mask: jnp.ndarray = jnp.zeros(
-        6 * 26, dtype=jnp.bool_
+        6 * 26 + 21, dtype=jnp.bool_
     )
     expected_legal_action_mask = expected_legal_action_mask.at[
         6 * (19 + 2) + 5
@@ -774,7 +774,7 @@ def test_observe():
     expected_obs = jnp.concatenate(
         (board, jnp.array([1, 1, 0, 0, 0, 0])), axis=None
     )
-    assert (observe(state, jnp.int32(1)) == expected_obs).all()
+    assert (observe(state) == expected_obs).all()
 
     state = make_test_state(
         current_player=jnp.int32(1),
@@ -787,7 +787,7 @@ def test_observe():
     expected_obs = jnp.concatenate(
         (board, jnp.array([0, 4, 0, 0, 0, 0])), axis=None
     )
-    assert (observe(state, jnp.int32(1)) == expected_obs).all()
+    assert (observe(state) == expected_obs).all()
 
     # current_player = black, playabl_dice = (2)
     state = make_test_state(
@@ -801,20 +801,7 @@ def test_observe():
     expected_obs = jnp.concatenate(
         (board, jnp.array([0, 1, 0, 0, 0, 0])), axis=None
     )
-    assert (observe(state, jnp.int32(1)) == expected_obs).all()
-
-    state = make_test_state(
-        current_player=jnp.int32(1),
-        board=board,
-        turn=jnp.int32(-1),
-        dice=jnp.array([0, 1], dtype=jnp.int32),
-        playable_dice=jnp.array([-1, 1, -1, -1], dtype=jnp.int32),
-        played_dice_num=jnp.int32(0),
-    )
-    expected_obs = jnp.concatenate(
-        (1 * board, jnp.array([0, 0, 0, 0, 0, 0])), axis=None
-    )
-    assert (observe(state, jnp.int32(0)) == expected_obs).all()
+    assert (observe(state) == expected_obs).all()
 
 
 def test_is_open():
@@ -876,9 +863,11 @@ def test_distance_to_goal():
     assert _rear_distance(board) == _distance_to_goal(19)
 
 
-def test_calc_src():
-    assert _calc_src(1) == 24
-    assert _calc_src(2) == 0
+def test_action_to_src():
+    jax.debug.print("DEBUG test_action_to_src, {ans1}, {ans2}", ans1=_action_to_src(1), ans2=_action_to_src(2))
+    assert _action_to_src(0 * 6) < 0
+    assert _action_to_src(1 * 6) == 24
+    assert _action_to_src(2 * 6) == 0
 
 
 def test_calc_tgt():
@@ -953,7 +942,7 @@ def test_legal_action():
     # black
     playable_dice = jnp.array([3, 2, -1, -1], dtype=jnp.int32)
     expected_legal_action_mask: jnp.ndarray = jnp.zeros(
-        6 * 26, dtype=jnp.bool_
+        6 * 26 + 21, dtype=jnp.bool_
     )
     expected_legal_action_mask = expected_legal_action_mask.at[
         6 * (19 + 2) + 3
@@ -981,7 +970,7 @@ def test_legal_action():
     assert (expected_legal_action_mask == legal_action_mask).all()
 
     playable_dice = jnp.array([5, 5, 5, 5], dtype=jnp.int32)
-    expected_legal_action_mask = jnp.zeros(6 * 26, dtype=jnp.bool_)
+    expected_legal_action_mask = jnp.zeros(6 * 26 + 21, dtype=jnp.bool_)
     expected_legal_action_mask = expected_legal_action_mask.at[
         6 * (19 + 2) + 5
     ].set(True)
@@ -992,7 +981,7 @@ def test_legal_action():
     board = _flip_board(board)
     playable_dice = jnp.array([4, 1, -1, -1], dtype=jnp.int32)
     expected_legal_action_mask: jnp.ndarray = jnp.zeros(
-        6 * 26, dtype=jnp.bool_
+        6 * 26 + 21, dtype=jnp.bool_
     )
     expected_legal_action_mask = expected_legal_action_mask.at[6 * 1 + 1].set(
         True
@@ -1002,7 +991,7 @@ def test_legal_action():
 
     playable_dice = jnp.array([4, 4, 4, 4], dtype=jnp.int32)
     expected_legal_action_mask = jnp.zeros(
-        6 * 26, dtype=jnp.bool_
+        6 * 26 + 21, dtype=jnp.bool_
     )  # dance
     expected_legal_action_mask = expected_legal_action_mask.at[0:6].set(
         True
@@ -1012,7 +1001,7 @@ def test_legal_action():
 
     board_1 = make_test_board_1()
     playable_dice = jnp.array([1, 3, -1, -1], dtype=jnp.int32)
-    expected_legal_action_mask = jnp.zeros(6 * 26, dtype=jnp.bool_)
+    expected_legal_action_mask = jnp.zeros(6 * 26 + 21, dtype=jnp.bool_)
     expected_legal_action_mask = expected_legal_action_mask.at[
         6 * (15 + 2) + 3
     ].set(True)  # only using the 4 at index 15
@@ -1024,7 +1013,7 @@ def test_legal_action():
     board_1 = board_1.at[15].set(0)
     board_1 = board_1.at[19].set(1)
     playable_dice = jnp.array([1, -1, -1, -1], dtype=jnp.int32)
-    expected_legal_action_mask = jnp.zeros(6 * 26, dtype=jnp.bool_)
+    expected_legal_action_mask = jnp.zeros(6 * 26 + 21, dtype=jnp.bool_)
     expected_legal_action_mask = expected_legal_action_mask.at[
         6 * (19 + 2) + 1
     ].set(True)  # only using the 2 at index 19
@@ -1058,7 +1047,7 @@ def test_forced_moves():
         assert (black_checker_count == 15).all()
         assert (white_checker_count == -15).all()
 
-        parallel_games = 2
+        parallel_games = 20
 
         dice = jnp.array(dice, dtype=jnp.int32) - 1   # dice are encoded as 0 through 5
         playable_dice = _set_playable_dice(dice)
@@ -1077,25 +1066,50 @@ def test_forced_moves():
             legal_action_mask=_legal_action_mask(test_board, playable_dice)
         )
 
-        # make random moves and verify that the expected boards always match
-        answer_idx = 0
-        s = jax.jit(jax.vmap(lambda _ : start_state))(subkeys)   # TODO cleaner way? we want a copy of start_state for each subkeys element
+        # make a batched version of start_state
+        s = jax.jit(jax.vmap(lambda _ : start_state))(jnp.arange(parallel_games))
         vmap_step = jax.jit(jax.vmap(step))
+        answer_idx = 0
 
-        for move_num in range(1, max_move + 1):
+        # make random moves and verify that the expected boards always match
+        for move_num in range(1, max_move + 2):
             rng, subkey = jax.random.split(rng)
             a = act_randomly(subkey, s.legal_action_mask)
 
             rng, step_rng = jax.random.split(rng)
             step_keys = jax.random.split(step_rng, parallel_games)
+
+            if move_num == max_move + 1:
+                # about to step according to a chance action
+                assert (a >= 6 * 26).all()
+            else:
+                # about to step according to a player move action
+                assert (a < 6 * 26).all()
+
             s = vmap_step(s, a, step_keys)
 
             if move_num == max_move:
+                # next player is about to roll the dice
                 assert (s.current_player == jnp.array([1], dtype=jnp.int32)).all()
                 assert (s._played_dice_num == jnp.array([0], dtype=jnp.int32)).all()
+                assert (~s.legal_action_mask[..., 0:6*26]).all()     # chance action is next, all player moves are illegal
+                assert s.has_chance_logits().all()                   # chance action is next, we are using chance logits
+                assert jnp.isneginf(s.get_chance_logits()[..., 0:6*26]).all()   # player move actions have zero probability
+                assert (s._playable_dice == -1).all()                # new player has not yet rolled
             else:
-                assert (s.current_player == jnp.array([0], dtype=jnp.int32)).all()
-                assert (s._played_dice_num == jnp.array([move_num], dtype=jnp.int32)).all()
+                if move_num == max_move + 1:
+                    # next player is about to make their first move
+                    assert (s.current_player == jnp.array([1], dtype=jnp.int32)).all()
+                    assert (s._played_dice_num == jnp.array([0], dtype=jnp.int32)).all()
+                else:
+                    # current player is going to make a move
+                    assert (s.current_player == jnp.array([0], dtype=jnp.int32)).all()
+                    assert (s._played_dice_num == jnp.array([move_num], dtype=jnp.int32)).all()
+                assert (~s.legal_action_mask[..., 6*26:]).all()      # player move action is next, all dice moves are illegal
+                assert (~s.has_chance_logits()).all()                # player move action is next, we are not using chance logits
+                assert jnp.isneginf(s.get_chance_logits()[..., 6*26:]).all()    # chance actions have zero probability
+                assert (s._playable_dice != -1).any(axis=-1).all()   # existing or new now has playable dice
+
             if move_nums[answer_idx] == move_num:
                 # validate that the current board matches all game boards
                 cur_board = expected_boards[answer_idx]
