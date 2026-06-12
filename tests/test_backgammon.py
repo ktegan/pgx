@@ -1068,6 +1068,13 @@ def test_forced_moves():
         # make a batched version of start_state
         s = jax.jit(jax.vmap(lambda _ : start_state))(jnp.arange(parallel_games))
         vmap_step = jax.jit(jax.vmap(step))
+
+        # we need to use vmap for State methods so that the underlying methods can
+        # operate on State member data of the expected size instead of a batched
+        # version of State (PyTree) that has first dimension size of parallel_games
+        vmap_has_chance_logits_recalc = jax.vmap(State.has_chance_logits_recalc)
+        vmap_get_chance_logits        = jax.vmap(State.get_chance_logits)
+
         answer_idx = 0
 
         # make random moves and verify that the expected boards always match
@@ -1092,8 +1099,8 @@ def test_forced_moves():
                 assert (s.current_player == jnp.array([1], dtype=jnp.int32)).all()
                 assert (s._played_dice_num == jnp.array([0], dtype=jnp.int32)).all()
                 assert (~s.legal_action_mask[..., 0:6*26]).all()     # chance action is next, all player moves are illegal
-                assert s.has_chance_logits().all()                   # chance action is next, we are using chance logits
-                assert jnp.isneginf(s.get_chance_logits()[..., 0:6*26]).all()   # player move actions have zero probability
+                assert jnp.isneginf(vmap_get_chance_logits(s)[..., 0:6*26]).all()   # player move actions have zero probability
+                assert vmap_has_chance_logits_recalc(s).all()        # chance action is next, we are using chance logits
                 assert (s._playable_dice == -1).all()                # new player has not yet rolled
             else:
                 if move_num == max_move + 1:
@@ -1105,8 +1112,8 @@ def test_forced_moves():
                     assert (s.current_player == jnp.array([0], dtype=jnp.int32)).all()
                     assert (s._played_dice_num == jnp.array([move_num], dtype=jnp.int32)).all()
                 assert (~s.legal_action_mask[..., 6*26:]).all()      # player move action is next, all dice moves are illegal
-                assert (~s.has_chance_logits()).all()                # player move action is next, we are not using chance logits
-                assert jnp.isneginf(s.get_chance_logits()[..., 6*26:]).all()    # chance actions have zero probability
+                assert jnp.isneginf(vmap_get_chance_logits(s)[..., 6*26:]).all()    # chance actions have zero probability
+                assert (~vmap_has_chance_logits_recalc(s)).all()     # player move action is next, we are not using chance logits
                 assert (s._playable_dice != -1).any(axis=-1).all()   # existing or new now has playable dice
 
             if move_nums[answer_idx] == move_num:

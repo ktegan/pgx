@@ -118,19 +118,21 @@ class State(abc.ABC):
         """
         return jnp.full(self.current_player.shape, -jnp.inf, dtype=jnp.float32)
 
-    def has_chance_logits(self, chance_logits:Array=None) -> Array:
-        if chance_logits is None:
-            chance_logits = self.get_chance_logits()
-        return ~(jnp.isneginf(chance_logits).all(axis=-1))
+    def has_chance_logits(self, chance_logits) -> Array:
+        return (~jnp.isneginf(chance_logits)).any()
 
-    def get_normal_or_chance_logits(self, logits:Array, chance_logits:Array=None) -> Array:
+    def has_chance_logits_recalc(self) -> Array:
+        return self.has_chance_logits(self.get_chance_logits())
+
+    def get_normal_or_chance_logits(self, logits:Array, chance_logits:Array) -> Array:
         """
         Assuming that every node is either a chance node or an action node this
         returns chance logits if any are available, otherwise non-chance logits.
         """
-        if chance_logits is None:
-            chance_logits = self.get_chance_logits()
         return jnp.where(self.has_chance_logits(chance_logits), chance_logits, logits)
+
+    def get_normal_or_chance_logits_recalc(self, logits:Array) -> Array:
+        return self.get_normal_or_chance_logits(logits, self.get_chance_logits())
 
     @property
     @abc.abstractmethod

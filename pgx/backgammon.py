@@ -22,6 +22,7 @@ import pgx.core as core
 from pgx._src.struct import dataclass
 from pgx._src.types import Array, PRNGKey
 
+
 TRUE = jnp.bool_(True)
 FALSE = jnp.bool_(False)
 
@@ -74,11 +75,6 @@ DICE_ROLL_LOGITS      = jnp.array([jnp.log(2.0 / (DICE_SIDES * DICE_SIDES)) if (
 CHANCE_ACTION_LOGITS  = jnp.concatenate([jnp.full(ACTION_MOVE_LENGTH, -jnp.inf, dtype=jnp.float32), DICE_ROLL_LOGITS])
 EMPTY_ACTION_LOGITS   = jnp.full(ACTION_TOTAL_LENGTH, -jnp.inf, dtype=jnp.float32)
 
-# index 0 for non-double rolls, index 1 for double rolls
-ROLL_PROBABILITY = jnp.array([2.0 / 36.0, 1.0 / 36.0], dtype=jnp.float32)
-ROLL_LOGITS = jnp.log(ROLL_PROBABILITY)
-
-
 
 @dataclass
 class State(core.State):
@@ -94,7 +90,7 @@ class State(core.State):
     # _board stores an integer for each board points(24), bar(2) and off(2),
     # positive values are the count of black pieces, negative for white
     _board: Array = jnp.zeros(ALL_GAME_POSITIONS, dtype=jnp.int32)
-    _dice: Array = jnp.zeros(DICE_SIDES, dtype=jnp.int32)  # indices 0 to 5 map to dice rolls 1 through 6
+    _dice: Array = jnp.zeros(NUM_DICE, dtype=jnp.int32)  # indices 0 to 5 map to dice rolls 1 through 6
     _playable_dice: Array = jnp.zeros(MAX_MOVES, dtype=jnp.int32)  # playable dice, NO_MOVE used for unusable moves
     _played_dice_num: Array = jnp.int32(0)  # the number of dice played
     _turn: Array = jnp.int32(1)  # black: 0 white:1
@@ -108,8 +104,8 @@ class State(core.State):
         This returns the chance logits for all possible rolls when have flipped
         the board to a new player's turn but have not yet rolled their dice.
         """
-        is_start_of_turn = (jnp.sum(self._playable_dice, axis=-1) == NO_MOVE_SUM) & (self._played_dice_num == 0)
-        return jnp.where(is_start_of_turn[..., jnp.newaxis], CHANCE_ACTION_LOGITS, EMPTY_ACTION_LOGITS)
+        is_start_of_turn = (jnp.sum(self._playable_dice) == NO_MOVE_SUM) & (self._played_dice_num == 0)
+        return jnp.where(is_start_of_turn, CHANCE_ACTION_LOGITS, EMPTY_ACTION_LOGITS)
 
 
 class Backgammon(core.Env):

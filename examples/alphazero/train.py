@@ -95,7 +95,7 @@ def recurrent_fn(model, rng_key: jnp.ndarray, action: jnp.ndarray, state: pgx.St
     # mask invalid actions
     logits = logits - jnp.max(logits, axis=-1, keepdims=True)
     logits = jnp.where(state.legal_action_mask, logits, jnp.finfo(logits.dtype).min)
-    logits = state.get_normal_or_chance_logits(logits)
+    logits = state.get_normal_or_chance_logits_recalc(logits)
 
     reward = state.rewards[jnp.arange(state.rewards.shape[0]), current_player]
     value = jnp.where(state.terminated, 0.0, value)
