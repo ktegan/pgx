@@ -21,6 +21,7 @@ import jax.numpy as jnp
 import pgx.core as core
 from pgx._src.struct import dataclass
 from pgx._src.types import Array, PRNGKey
+from pgx._src.utils import chunked_map
 
 
 TRUE = jnp.bool_(True)
@@ -91,7 +92,7 @@ class State(core.State):
     # positive values are the count of black pieces, negative for white
     _board: Array = jnp.zeros(ALL_GAME_POSITIONS, dtype=jnp.int32)
     _dice: Array = jnp.zeros(NUM_DICE, dtype=jnp.int32)  # indices 0 to 5 map to dice rolls 1 through 6
-    _playable_dice: Array = jnp.zeros(MAX_MOVES, dtype=jnp.int32)  # playable dice, NO_MOVE used for unusable moves
+    _playable_dice: Array = jnp.full(MAX_MOVES, NO_MOVE, dtype=jnp.int32)  # playable dice, NO_MOVE used for unusable moves
     _played_dice_num: Array = jnp.int32(0)  # the number of dice played
     _turn: Array = jnp.int32(1)  # black: 0 white:1
 
@@ -211,7 +212,7 @@ def _to_playable_dice_count(playable_dice: Array) -> Array:
     """
     Return 6 dim vec which represents the number of playable die
     Examples
-    Playable dice: 2, 3
+    Playable dice: 2, 3, -1, -1
     Return: [0, 1, 1, 0, 0, 0]
 
     Playable dice: 4, 4, 4, 4
@@ -326,6 +327,7 @@ def _change_turn(state: State, key) -> State:
         _turn=(state._turn + 1) % 2,
         current_player=(state.current_player + 1) % 2,
         legal_action_mask=~jnp.isneginf(CHANCE_ACTION_LOGITS),  # only chance actions are allowed
+        _playable_dice=jnp.full(MAX_MOVES, NO_MOVE, dtype=jnp.int32),
         _played_dice_num=jnp.int32(0),
     )
 
@@ -440,7 +442,7 @@ def _calc_tgt(src: int, die) -> int:
     When we come in from the bar a roll of 1 translates to the first
     index on the board which is index 0, so we land on index = die - 1.
     """
-    is_from_bar = src >= BOARD_LENGTH
+    is_from_bar = (src == BAR_IDX)
     return jnp.where(is_from_bar, jnp.int32(die) - 1, jnp.int32(_tgt_from_board(src, die)))  # type: ignore
 
 
@@ -463,14 +465,15 @@ def _decompose_action(action: Array):
 
 def _is_action_legal(board: Array, action: Array) -> bool:
     """
-    Check if the action is legal.
+    Check if the action is legal.  Noop (negative src) is not considered legal in this function.
     action = src * 6 + die
     src = [no op., from bar, 0, .., 23]
     """
-    src, die, tgt = _decompose_action(action)
-    _is_to_point = (0 <= tgt) & (tgt < BOARD_LENGTH) & (src >= 0)
-    return jnp.where(_is_to_point, _is_to_point_legal(board, src, tgt),
-                                   _is_to_off_legal(board, src, tgt, die))  # type: ignore
+    src, die, tgt   = _decompose_action(action)
+    is_regular_move = (src >= 0) & (src <= BAR_IDX)   # not noop or chance action
+    _is_to_point    = (tgt < BOARD_LENGTH)
+    return is_regular_move & jnp.where(_is_to_point, _is_to_point_legal(board, src, tgt),
+                                                     _is_to_off_legal(board, src, tgt, die))  # type: ignore
 
 
 def _distance_to_goal(src: int) -> int:
@@ -490,8 +493,9 @@ def _is_to_off_legal(board: Array, src: int, tgt: int, die: int):
     """
     r = _rear_distance(board)
     d = _distance_to_goal(src)
+    is_regular_move = (src >= 0) & (src <= BAR_IDX)   # not noop or chance action
     return (
-        (src >= 0) & _exists(board, src) & _is_all_on_home_board(board) & ((d == die) | ((r <= die) & (r == d)))
+        is_regular_move & _exists(board, src) & _is_all_on_home_board(board) & ((d == die) | ((r <= die) & (r == d)))
     )  # type: ignore
 
 
@@ -502,8 +506,8 @@ def _is_to_point_legal(board: Array, src: int, tgt: int) -> bool:
     e = _exists(board, src)
     o = _is_open(board, tgt)
     nothing_on_bar = (board[BAR_IDX] == 0)
-    is_not_noop = (src >= 0)
-    return e & o & is_not_noop & ((src == BAR_IDX) | nothing_on_bar)
+    is_regular_move = (src >= 0) & (src <= BAR_IDX)   # not noop or chance action
+    return e & o & is_regular_move & ((src == BAR_IDX) | nothing_on_bar)
 
 
 def _move(board: Array, action: Array) -> Array:
@@ -550,27 +554,57 @@ def _remains_at_inner(board: Array) -> bool:
     return jnp.take(board, _home_board()).sum() != 0  # type: ignore
 
 
+def _can_use_other_die(action_die_pair, is_selected, board, playable_dice):
+    first_action, last_die = action_die_pair
+
+    def handle_action():
+        new_board = _move(board, first_action)
+        other_playable_dice = jnp.where(playable_dice == last_die, NO_MOVE, playable_dice)
+        next_legal_actions = jax.vmap(partial(_legal_action_mask_for_single_die, board=new_board))(die=other_playable_dice) # return 2D (SRC_LENGTH, DICE_SIDES) array
+        return next_legal_actions.any()
+
+    return jax.lax.cond(is_selected & (last_die != NO_MOVE), handle_action, lambda: FALSE)
+
+
 def _legal_action_mask(board: Array, playable_dice: Array) -> Array:
     start_idx = SRC_NO_MOVE * DICE_SIDES
     no_op_mask = jnp.zeros(ACTION_TOTAL_LENGTH, dtype=jnp.bool_).at[start_idx:start_idx + DICE_SIDES].set(TRUE)
     legal_actions = jax.vmap(partial(_legal_action_mask_for_single_die, board=board))(die=playable_dice) # return 2D (SRC_LENGTH, DICE_SIDES) array
-    any_legal_actions_per_dice = legal_actions.any(axis=0)
+    dice_has_valid_first_moves = legal_actions.any(axis=1)
 
-    # from bkgm.com: A player must use both numbers of a roll if this is legally possible
-    #   (or all four numbers of a double). When only one number can be played, the player
-    #   must play that number. Or if either number can be played but not both, the player
-    #   must play the larger one. When neither number can be used, the player loses his turn.
-    #   In the case of doubles, when all four numbers cannot be played, the player must play
-    #   as many numbers as he can.
+    # Backgammon movement rules from bkgm.com: A player must use both numbers of a roll if
+    #   this is legally possible (or all four numbers of a double). When only one number can
+    #   be played, the player must play that number. Or if either number can be played but not
+    #   both, the player must play the larger one. When neither number can be used, the player
+    #   loses his turn.  In the case of doubles, when all four numbers cannot be played, the
+    #   player must play as many numbers as he can.
 
-    # TODO The only cases where this adds complexity are that you can only do moves that lead to
-    # another valid move when you have two different rolls.  Additionally in the case where
-    # you have two different rolls and either can be played but not both only rolls that use
-    # the larger die value are valid.
+    # Compute which moves can lead to subsequent second moves
+    flat_array_shape = ACTION_TOTAL_LENGTH * MAX_MOVES
+    flat_actions = jnp.tile(jnp.arange(ACTION_TOTAL_LENGTH), (MAX_MOVES, 1)).reshape(flat_array_shape)
+    flat_last_die = jnp.tile(playable_dice[..., jnp.newaxis], (1, ACTION_TOTAL_LENGTH)).reshape(flat_array_shape)
+    flat_legal_moves = legal_actions.reshape(flat_array_shape)
+    selection_indices, results = chunked_map(_can_use_other_die, (flat_actions, flat_last_die), flat_legal_moves,
+                                             func_kwargs={'board': board, 'playable_dice': playable_dice}, func_uses_is_selected=True)
+    action_has_valid_second_moves = jnp.zeros(flat_array_shape, dtype=jnp.bool_)
 
-    legal_action_exists = ~(any_legal_actions_per_dice.sum() == 0)
+    action_has_valid_second_moves = action_has_valid_second_moves.at[selection_indices].set(results)
+    action_has_valid_second_moves = action_has_valid_second_moves.reshape((MAX_MOVES, ACTION_TOTAL_LENGTH))
 
-    return jnp.where(legal_action_exists, any_legal_actions_per_dice, no_op_mask)
+    any_valid_second_moves = action_has_valid_second_moves.any()
+    two_move_actions = legal_actions & action_has_valid_second_moves
+    two_move_actions = two_move_actions.any(axis=0)   # if an action works for any playable dice it is legal
+
+    # We must use the largest roll if no second moves are available
+    playable_dice_with_one_move = jnp.where(dice_has_valid_first_moves, playable_dice, NO_MOVE)
+    largest_die_with_one_move = jnp.max(playable_dice_with_one_move)  # a playable die will always be greater than NO_MOVE which is negative
+    one_move_actions = legal_actions & (playable_dice == largest_die_with_one_move)[..., jnp.newaxis]
+    one_move_actions = one_move_actions.any(axis=0)
+
+    out = jnp.where(legal_actions.any(),
+                    jnp.where(any_valid_second_moves, two_move_actions, one_move_actions),
+                    no_op_mask)
+    return out
 
 
 def _legal_action_mask_for_single_die(board: Array, die: int) -> Array:
@@ -578,7 +612,7 @@ def _legal_action_mask_for_single_die(board: Array, die: int) -> Array:
     Legal action mask for a single die.
     """
     return jnp.where(die == NO_MOVE, jnp.zeros(ACTION_TOTAL_LENGTH, dtype=jnp.bool_),
-                                    _legal_action_mask_for_valid_single_dice(board, die))
+                                     _legal_action_mask_for_valid_single_dice(board, die))
 
 
 def _legal_action_mask_for_valid_single_dice(board: Array, die: int) -> Array:

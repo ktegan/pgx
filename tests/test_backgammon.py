@@ -74,7 +74,7 @@ Bar ----
 Off +++++++
 """
 
-def make_test_board_1():
+def make_test_board_use_2_moves_simple():
     """
     Test that we do both legal moves.  If we roll a 2 and a 4
     then the black checker at index 15 must move to index 19
@@ -101,7 +101,7 @@ Bar
 Off +++++++++++   -----------
 """
 
-def make_answer_1():
+def make_answer_use_2_moves_simple():
     """
     Give the expected board state where the target number of moves is the,
     final element.  We assume that if an answer goes up to move X it means
@@ -119,7 +119,7 @@ def make_answer_1():
     ], dtype=jnp.int32))
 
 
-def make_test_board_1a():
+def make_test_board_use_4_moves_simple():
     """
     Test that we do all 4 legal moves.  If we roll double 2's
     then the black checker at index 15 must move to index 23
@@ -144,7 +144,7 @@ Bar
 Off ++++++++++++  -------------
 """
 
-def make_answer_1a():
+def make_answer_use_4_moves_simple():
     return ([2, 2], jnp.array([
         [ #  0,  1,  2,  3,  4,  5,    6,  7,  8,  9, 10, 11,
              0,  0,  0,  0,  0,  0,    0,  0,  0,  0,  0,  0,
@@ -165,7 +165,7 @@ def make_answer_1a():
     ], dtype=jnp.int32))
 
 
-def make_test_board_2():
+def make_test_board_use_2_moves_order_matters():
     """
     Check the case where we have to use dice in a specific order to make sure
     both dice are played.  This is an Example from the "Watch It Played" backgammon
@@ -176,7 +176,7 @@ def make_test_board_2():
         #  0,  1,  2,  3,  4,  5,    6,  7,  8,  9, 10, 11,
            2, -2, -2,  0, -2, -3,    0,  0,  0,  0,  0,  5,
         # 12, 13, 14, 15, 16, 17,   18, 19, 20, 21, 22, 23,   24, 25,   26, 27
-           0,  0,  0, -2,  0,  3,    5,  0,  0, -2,  0, -2,    0,  0,    0,  0
+           0,  0,  0, -2,  0,  3,    5,  0,  0, -2, -2,  0,    0,  0,    0,  0
     ], dtype=jnp.int32)
 
 """
@@ -199,67 +199,23 @@ Off
 """
 
 
-def make_answer_2():
+def make_answer_use_2_moves_order_matters():
     return ([4, 6], jnp.array([
         [ #  0,  1,  2,  3,  4,  5,    6,  7,  8,  9, 10, 11,
              1, -2, -2,  0, -2, -3,    1,  0,  0,  0,  0,  5,
           # 12, 13, 14, 15, 16, 17,   18, 19, 20, 21, 22, 23,   24, 25,   26, 27,     28
-             0,  0,  0, -2,  0,  3,    5,  0,  0, -2,  0, -2,    0,  0,    0,  0,     1],
+             0,  0,  0, -2,  0,  3,    5,  0,  0, -2, -2,  0,    0,  0,    0,  0,     1],
         [ #  0,  1,  2,  3,  4,  5,    6,  7,  8,  9, 10, 11,
              1, -2, -2,  0, -2, -3,    0,  0,  0,  0,  1,  5,
           # 12, 13, 14, 15, 16, 17,   18, 19, 20, 21, 22, 23,   24, 25,   26, 27,     28
-             0,  0,  0, -2,  0,  3,    5,  0,  0, -2,  0, -2,    0,  0,    0,  0,     2],
+             0,  0,  0, -2,  0,  3,    5,  0,  0, -2, -2,  0,    0,  0,    0,  0,     2],
     ], dtype=jnp.int32))
 
 
-def make_test_board_3():
+def make_test_board_use_1_move_higher_roll():
     """
-    Check the case where we have to use the larger of the two rolls.
-    In this case we can either play only the 4, or only the 6, so we
-    must take the larger number.  The only legal move is to play the 6
-    from index 11.
-    """
-    return jnp.array([
-        #  0,  1,  2,  3,  4,  5,    6,  7,  8,  9, 10, 11,
-           2, -2,  0,  0,  0, -3,   -2,  0,  0,  0, -2,  5,
-        # 12, 13, 14, 15, 16, 17,   18, 19, 20, 21, 22, 23,   24, 25,   26, 27
-           0,  0,  0, -2,  0,  3,    5,  0,  0, -2, -2,  0,    0,  0,    0,  0
-    ], dtype=jnp.int32)
-
-
-"""
-黒: + 白: -
-12 13 14 15 16 17  18 19 20 21 22 23
-          -     +   +        -  -
-          -     +   +        -  -
-                +   +
-                    +
-                    +
- 
- +
- +
- +                  -
- +  -           -   -           -  +
- +  -           -   -           -  +
-11 10  9  8  7  6   5  4  3  2  1  0
-Bar
-Off
-"""
-
-
-def make_answer_3():
-    return ([4, 6], jnp.array([
-        [ #  0,  1,  2,  3,  4,  5,    6,  7,  8,  9, 10, 11,
-             2, -2,  0,  0,  0, -3,   -2,  0,  0,  0, -2,  4,
-          # 12, 13, 14, 15, 16, 17,   18, 19, 20, 21, 22, 23,   24, 25,   26, 27,    28
-             0,  0,  0, -2,  0,  3,    6,  0,  0, -2, -2,  0,    0,  0,    0,  0,     1],
-    ], dtype=jnp.int32))
-
-
-def make_test_board_4():
-    """
-    Check another case similar to where we must use the larger of two rolls.
-    In this case if a 4 and 6 are rolled we must move the black checker from
+    Check a case where we must use the larger of two rolls.  In this case
+    if a 4 and 6 are rolled we must move the black checker from
     index 0 to index 6.  Another example from "Watch It Played".
     """
     return jnp.array([
@@ -290,7 +246,7 @@ Off
 """
 
 
-def make_answer_4():
+def make_answer_use_1_move_higher_roll():
     return ([4, 6], jnp.array([
         [ #  0,  1,  2,  3,  4,  5,    6,  7,  8,  9, 10, 11,
              0,  0,  0, -2, -1, -2,    1,  0,  0,  4, -2,  5,
@@ -300,9 +256,9 @@ def make_answer_4():
 
 
 
-def make_test_board_5():
+def make_test_board_use_3_moves_simple():
     """
-    Check that all three three valid moves are used.  In this case if we roll double sixes the
+    Check that all three valid moves are used.  In this case if we roll double sixes the
     black checker at index 9 must move to index 21 and the checker at
     index 5 must move to index 11 (order within those moves is not restricted).
     """
@@ -328,19 +284,19 @@ Off +++++++++++   ----------
 """
 
 
-def make_answer_5():
+def make_answer_use_3_moves_simple():
     return ([6, 6], jnp.array([
         [ #  0,  1,  2,  3,  4,  5,    6,  7,  8,  9, 10, 11,
              0,  0,  0,  0,  0,  0,    0,  0,  0,  0,  0,  1,
           # 12, 13, 14, 15, 16, 17,   18, 19, 20, 21, 22, 23,   24, 25,   26,  27,    28
-             0,  0,  0,  0,  0, -2,    0,  0,  0,  1,  2, -2,    0,  1,   11, -10,     3],
+             0,  0,  0,  0,  0, -2,    0,  0,  0,  1,  2, -2,    0, -1,   11, -10,     3],
     ], dtype=jnp.int32))
 
 
-def make_test_board_6():
+def make_test_board_use_4_moves_bear_off_v1():
     """
     Test that we do all 4 legal moves.  If we roll double 4's
-    then the black checker at index 10 must move to index 21 (hitting
+    then the black checker at index 9 must move to index 21 (hitting
     on index 17 along the way), at which point one checker bears off
     at index 20.
     """
@@ -354,8 +310,54 @@ def make_test_board_6():
 """
 黒: + 白: -
 12 13 14 15 16 17  18 19 20 21 22 23
+               -1         +        -
                           +        -
-                          +        -
+
+ 
+       +
+11 10  9  8  7  6   5  4  3  2  1  0
+Bar
+Off ++++++++++++  -------------
+"""
+
+def make_answer_use_4_moves_bear_off_v1():
+    return ([4, 4], jnp.array([
+        [ #  0,  1,  2,  3,  4,  5,    6,  7,  8,  9, 10, 11,
+             0,  0,  0,  0,  0,  0,    0,  0,  0,  0,  0,  0,
+          # 12, 13, 14, 15, 16, 17,   18, 19, 20, 21, 22, 23,   24, 25,   26,  27,    28
+             0,  1,  0,  0,  0, -1,    0,  0,  2,  0,  0, -2,    0,  0,   12, -12,     1],
+        [ #  0,  1,  2,  3,  4,  5,    6,  7,  8,  9, 10, 11,
+             0,  0,  0,  0,  0,  0,    0,  0,  0,  0,  0,  0,
+          # 12, 13, 14, 15, 16, 17,   18, 19, 20, 21, 22, 23,   24, 25,   26,  27,    28
+             0,  0,  0,  0,  0,  1,    0,  0,  2,  0,  0, -2,    0, -1,   12, -12,     2],
+        [ #  0,  1,  2,  3,  4,  5,    6,  7,  8,  9, 10, 11,
+             0,  0,  0,  0,  0,  0,    0,  0,  0,  0,  0,  0,
+          # 12, 13, 14, 15, 16, 17,   18, 19, 20, 21, 22, 23,   24, 25,   26,  27,    28
+             0,  0,  0,  0,  0,  0,    0,  0,  2,  1,  0, -2,    0, -1,   12, -12,     3],
+        [ #  0,  1,  2,  3,  4,  5,    6,  7,  8,  9, 10, 11,
+             0,  0,  0,  0,  0,  0,    0,  0,  0,  0,  0,  0,
+          # 12, 13, 14, 15, 16, 17,   18, 19, 20, 21, 22, 23,   24, 25,   26,  27,    28
+             0,  0,  0,  0,  0,  0,    0,  0,  1,  1,  0, -2,    0, -1,   13, -12,     4],
+    ], dtype=jnp.int32))
+
+
+
+def make_test_board_use_4_moves_bear_off_v2():
+    """
+    Same as the previous test but the black checker bears off at index 21.
+    """
+    return jnp.array([
+        #  0,  1,  2,  3,  4,  5,    6,  7,  8,  9, 10, 11,
+           0,  0,  0,  0,  0,  0,    0,  0,  0,  0,  1,  0,
+        # 12, 13, 14, 15, 16, 17,   18, 19, 20, 21, 22, 23,   24, 25,   26,  27
+           0,  0,  0,  0,  0, -1,    0,  0,  0,  2,  0, -2,    0,  0,   12, -12
+    ], dtype=jnp.int32)
+
+"""
+黒: + 白: -
+12 13 14 15 16 17  18 19 20 21 22 23
+                -            +     -
+                             +     -
 
  
     +
@@ -364,29 +366,29 @@ Bar
 Off ++++++++++++  -------------
 """
 
-def make_answer_6():
+def make_answer_use_4_moves_bear_off_v2():
     return ([4, 4], jnp.array([
         [ #  0,  1,  2,  3,  4,  5,    6,  7,  8,  9, 10, 11,
              0,  0,  0,  0,  0,  0,    0,  0,  0,  0,  0,  0,
           # 12, 13, 14, 15, 16, 17,   18, 19, 20, 21, 22, 23,   24, 25,   26,  27,    28
-             0,  1,  0,  0,  0, -1,    0,  0,  2,  0,  0, -2,    0,  0,   12, -13,     1],
+             0,  0,  1,  0,  0, -1,    0,  0,  0,  2,  0, -2,    0,  0,   12, -12,     1],
         [ #  0,  1,  2,  3,  4,  5,    6,  7,  8,  9, 10, 11,
              0,  0,  0,  0,  0,  0,    0,  0,  0,  0,  0,  0,
           # 12, 13, 14, 15, 16, 17,   18, 19, 20, 21, 22, 23,   24, 25,   26,  27,    28
-             0,  0,  0,  0,  0,  1,    0,  0,  2,  0,  0, -2,    0, -1,   12, -13,     2],
+             0,  0,  0,  0,  0, -1,    1,  0,  0,  2,  0, -2,    0,  0,   12, -12,     2],
         [ #  0,  1,  2,  3,  4,  5,    6,  7,  8,  9, 10, 11,
              0,  0,  0,  0,  0,  0,    0,  0,  0,  0,  0,  0,
           # 12, 13, 14, 15, 16, 17,   18, 19, 20, 21, 22, 23,   24, 25,   26,  27,    28
-             0,  0,  0,  0,  0,  0,    0,  0,  2,  1,  0, -2,    0, -1,   12, -13,     3],
+             0,  0,  0,  0,  0, -1,    0,  0,  0,  2,  1, -2,    0,  0,   12, -12,     3],
         [ #  0,  1,  2,  3,  4,  5,    6,  7,  8,  9, 10, 11,
              0,  0,  0,  0,  0,  0,    0,  0,  0,  0,  0,  0,
           # 12, 13, 14, 15, 16, 17,   18, 19, 20, 21, 22, 23,   24, 25,   26,  27,    28
-             0,  0,  0,  0,  0,  0,    0,  0,  1,  1,  0, -2,    0, -1,   13, -13,     4],
+             0,  0,  0,  0,  0, -1,    0,  0,  0,  1,  1, -2,    0,  0,   13, -12,     4],
     ], dtype=jnp.int32))
 
 
 
-def make_test_board_7():
+def make_test_board_use_2_of_4_moves():
     """
     Test that we do all 2 legal moves.  If we roll double 4's
     then the black checker at index 11 must move to index 19, at which
@@ -412,7 +414,7 @@ Bar
 Off ++++++++++++  -------------
 """
 
-def make_answer_7():
+def make_answer_use_2_of_4_moves():
     return ([4, 4], jnp.array([
         [ #  0,  1,  2,  3,  4,  5,    6,  7,  8,  9, 10, 11,
              0,  0,  0,  0,  0,  0,    0,  0,  0,  0,  0,  0,
@@ -425,7 +427,7 @@ def make_answer_7():
     ], dtype=jnp.int32))
 
 
-def make_test_board_8():
+def make_test_board_use_3_moves_bear_off_v1():
     """
     Test that we do all 3 legal moves.  If we roll double 4's
     then the black checker at index 15 must move to index 19, at which
@@ -451,7 +453,7 @@ Off ++++++++++++  -------------
 """
 
 
-def make_answer_8():
+def make_answer_use_3_moves_bear_off_v1():
     return ([4, 4], jnp.array([
         [ #  0,  1,  2,  3,  4,  5,    6,  7,  8,  9, 10, 11,
              0,  0,  0,  0,  0,  0,    0,  0,  0,  0,  0,  0,
@@ -468,7 +470,7 @@ def make_answer_8():
     ], dtype=jnp.int32))
 
 
-def make_test_board_9():
+def make_test_board_use_3_moves_bear_off_v2():
     """
     Test that we do all 3 legal moves.  If we roll double 3's
     then the black checker at index 17 must move to index 20 and
@@ -495,7 +497,7 @@ Off +++++++++++++ -------------
 """
 
 
-def make_answer_9():
+def make_answer_use_3_moves_bear_off_v2():
     return ([3, 3], jnp.array([
         [ #  0,  1,  2,  3,  4,  5,    6,  7,  8,  9, 10, 11,
              0,  0,  0,  0,  0,  0,    0,  0,  0,  0,  0,  0,
@@ -504,20 +506,19 @@ def make_answer_9():
     ], dtype=jnp.int32))
 
 
-def make_test_board_10():
+def make_test_board_use_2_moves_bear_off_order_matters():
     """
     Test that we use both values when bearing off.  In this case
     if we roll a 6 and 4 we must use the 4 first at index 18, because
     that's the only way to use the 4 and 6 rolls.  In this case
     the black checker at index 18 moves to index 22 and one of the
-    checkers at index 19 bears off.  This modifies the number of
-    checkers on index 18 but otherwise matches an example from Watch It Played.
+    checkers at index 19 bears off.  This is another example from Watch It Played.
     """
     return jnp.array([
         #  0,  1,  2,  3,  4,  5,    6,  7,  8,  9, 10, 11,
            0,  0,  0,  0,  0,  0,    0,  0,  0,  0,  0,  0,
         # 12, 13, 14, 15, 16, 17,   18, 19, 20, 21, 22, 23,   24, 25,   26,  27
-           0,  0,  0,  0,  0,  0,    2,  2,  0,  1,  0, -2,    0,  0,   11, -13
+           0,  0,  0,  0,  0,  0,    1,  2,  0,  1,  0, -2,    0,  0,   11, -13
     ], dtype=jnp.int32)
 
 """
@@ -533,16 +534,16 @@ Off ++++++++++++  -------------
 """
 
 
-def make_answer_10():
+def make_answer_use_2_moves_bear_off_order_matters():
     return ([6, 4], jnp.array([
         [ #  0,  1,  2,  3,  4,  5,    6,  7,  8,  9, 10, 11,
              0,  0,  0,  0,  0,  0,    0,  0,  0,  0,  0,  0,
           # 12, 13, 14, 15, 16, 17,   18, 19, 20, 21, 22, 23,   24, 25,   26,  27,    28
-             0,  0,  0,  0,  0,  0,    1,  2,  0,  1,  1, -2,    0,  0,   10, -13,     1],
+             0,  0,  0,  0,  0,  0,    0,  2,  0,  1,  1, -2,    0,  0,   11, -13,     1],
         [ #  0,  1,  2,  3,  4,  5,    6,  7,  8,  9, 10, 11,
              0,  0,  0,  0,  0,  0,    0,  0,  0,  0,  0,  0,
           # 12, 13, 14, 15, 16, 17,   18, 19, 20, 21, 22, 23,   24, 25,   26,  27,    28
-             0,  0,  0,  0,  0,  0,    1,  1,  0,  1,  1, -2,    0,  0,   11, -13,     2],
+             0,  0,  0,  0,  0,  0,    0,  1,  0,  1,  1, -2,    0,  0,   12, -13,     2],
     ], dtype=jnp.int32))
 
 
@@ -938,7 +939,7 @@ def test_move():
 
 def test_legal_action():
     board = make_test_board()
-    # black
+    # black rolling a 4 and a 3
     playable_dice = jnp.array([3, 2, -1, -1], dtype=jnp.int32)
     expected_legal_action_mask: jnp.ndarray = jnp.zeros(
         6 * 26 + 21, dtype=jnp.bool_
@@ -964,8 +965,6 @@ def test_legal_action():
         True
     )  # 21->off
     legal_action_mask = _legal_action_mask(board, playable_dice)
-    print(jnp.where(legal_action_mask != 0)[0])
-    print(jnp.where(expected_legal_action_mask != 0)[0])
     assert (expected_legal_action_mask == legal_action_mask).all()
 
     playable_dice = jnp.array([5, 5, 5, 5], dtype=jnp.int32)
@@ -998,7 +997,7 @@ def test_legal_action():
     legal_action_mask = _legal_action_mask(board, playable_dice)
     assert (expected_legal_action_mask == legal_action_mask).all()
 
-    board_1 = make_test_board_1()
+    board_1 = make_test_board_use_2_moves_simple()
     playable_dice = jnp.array([1, 3, -1, -1], dtype=jnp.int32)
     expected_legal_action_mask = jnp.zeros(6 * 26 + 21, dtype=jnp.bool_)
     expected_legal_action_mask = expected_legal_action_mask.at[
@@ -1008,7 +1007,7 @@ def test_legal_action():
     assert (expected_legal_action_mask == legal_action_mask).all()
 
 
-    board_1 = make_test_board_1()
+    board_1 = make_test_board_use_2_moves_simple()
     board_1 = board_1.at[15].set(0)
     board_1 = board_1.at[19].set(1)
     playable_dice = jnp.array([1, -1, -1, -1], dtype=jnp.int32)
@@ -1023,23 +1022,30 @@ def test_legal_action():
 
 def test_forced_moves():
     board_answer_pairs = [
-        (make_test_board_1(),  make_answer_1()),
-        (make_test_board_1a(), make_answer_1a()),
-        #(make_test_board_2(),  make_answer_2()),
-        #(make_test_board_3(),  make_answer_3()),
-        #(make_test_board_4(),  make_answer_4()),
-        #(make_test_board_5(),  make_answer_5()),
-        #(make_test_board_6(),  make_answer_6()),
-        #(make_test_board_7(),  make_answer_7()),
-        #(make_test_board_8(),  make_answer_8()),
-        #(make_test_board_9(),  make_answer_9()),
-        #(make_test_board_10(), make_answer_10()),
+        (make_test_board_use_2_moves_simple(),                 make_answer_use_2_moves_simple()),
+        (make_test_board_use_4_moves_simple(),                 make_answer_use_4_moves_simple()),
+        (make_test_board_use_2_moves_order_matters(),          make_answer_use_2_moves_order_matters()),
+        (make_test_board_use_1_move_higher_roll(),             make_answer_use_1_move_higher_roll()),
+        (make_test_board_use_3_moves_simple(),                 make_answer_use_3_moves_simple()),
+        (make_test_board_use_4_moves_bear_off_v1(),            make_answer_use_4_moves_bear_off_v1()),
+        (make_test_board_use_4_moves_bear_off_v2(),            make_answer_use_4_moves_bear_off_v2()),
+        (make_test_board_use_2_of_4_moves(),                   make_answer_use_2_of_4_moves()),
+        (make_test_board_use_3_moves_bear_off_v1(),            make_answer_use_3_moves_bear_off_v1()),
+        (make_test_board_use_3_moves_bear_off_v2(),            make_answer_use_3_moves_bear_off_v2()),
+        (make_test_board_use_2_moves_bear_off_order_matters(), make_answer_use_2_moves_bear_off_order_matters()),
     ]
 
     for _test_num, (test_board, (dice, answer)) in enumerate(board_answer_pairs):
         expected_boards = answer[:,:28]
         move_nums = answer[:,28]
         max_move = jnp.max(move_nums)
+
+        rolled_doubles = dice[0] == dice[1]
+        theoretical_max_move = 4 if rolled_doubles else 2
+
+        # if we have less than the theoretical maximum number of moves than there is a no-op move
+        steps_after_max_move = (2 if (max_move < theoretical_max_move) else 1)
+        last_move_to_check = max_move + steps_after_max_move
 
         black_checker_count = jnp.sum(jnp.where(expected_boards > 0, expected_boards, 0), axis=1)
         white_checker_count = jnp.sum(jnp.where(expected_boards < 0, expected_boards, 0), axis=1)
@@ -1053,7 +1059,6 @@ def test_forced_moves():
 
         rng = jax.random.PRNGKey(0)
         rng, subkey = jax.random.split(rng)
-        subkeys = jax.random.split(subkey, parallel_games)
 
         start_state = make_test_state(
             current_player=jnp.int32(0),
@@ -1078,32 +1083,43 @@ def test_forced_moves():
         answer_idx = 0
 
         # make random moves and verify that the expected boards always match
-        for move_num in range(1, max_move + 2):
+        for move_num in range(1, last_move_to_check + 1):
             rng, subkey = jax.random.split(rng)
             a = act_randomly(subkey, s.legal_action_mask)
 
             rng, step_rng = jax.random.split(rng)
             step_keys = jax.random.split(step_rng, parallel_games)
 
-            if move_num == max_move + 1:
+            if move_num == max_move + steps_after_max_move:
                 # about to step according to a chance action
                 assert (a >= 6 * 26).all()
+            elif move_num == max_move + 1:
+                # player had to prematurely end their turn, this is a player noop action
+                assert (a < 6).all()
             else:
                 # about to step according to a player move action
                 assert (a < 6 * 26).all()
 
             s = vmap_step(s, a, step_keys)
 
-            if move_num == max_move:
-                # next player is about to roll the dice
-                assert (s.current_player == jnp.array([1], dtype=jnp.int32)).all()
-                assert (s._played_dice_num == jnp.array([0], dtype=jnp.int32)).all()
-                assert (~s.legal_action_mask[..., 0:6*26]).all()     # chance action is next, all player moves are illegal
-                assert jnp.isneginf(vmap_get_chance_logits(s)[..., 0:6*26]).all()   # player move actions have zero probability
-                assert vmap_has_chance_logits_recalc(s).all()        # chance action is next, we are using chance logits
-                assert (s._playable_dice == -1).all()                # new player has not yet rolled
+            if move_num >= max_move and move_num < max_move + steps_after_max_move:
+                if move_num == max_move + steps_after_max_move - 1:
+                    # next player is about to roll the dice
+                    assert (s.current_player == jnp.array([1], dtype=jnp.int32)).all()
+                    assert (s._played_dice_num == jnp.array([0], dtype=jnp.int32)).all()
+                    assert (~s.legal_action_mask[..., 0:6*26]).all()     # chance action is next, all player moves are illegal
+                    assert jnp.isneginf(vmap_get_chance_logits(s)[..., 0:6*26]).all()   # player move actions have zero probability
+                    assert vmap_has_chance_logits_recalc(s).all()        # chance action is next, we are using chance logits
+                    assert (s._playable_dice == -1).all()                # new player has not yet rolled
+                else:
+                    # current player has run out of moves and must make a noop move
+                    assert (s.current_player == jnp.array([0], dtype=jnp.int32)).all()
+                    assert (s._played_dice_num == jnp.array([max_move], dtype=jnp.int32)).all()
+                    #jax.debug.print('DEBUG KEGAN test_num {test_num} move_num {move_num}, dice {dice}, actions {actions}',
+                    #                test_num=_test_num, move_num=move_num, dice=dice, actions=jnp.where(s.legal_action_mask.any(axis=0), size=20, fill_value=-1)[0])
+                    assert (~s.legal_action_mask[..., 6:]).all()              # only noop action is allowed
             else:
-                if move_num == max_move + 1:
+                if move_num == max_move + steps_after_max_move:
                     # next player is about to make their first move
                     assert (s.current_player == jnp.array([1], dtype=jnp.int32)).all()
                     assert (s._played_dice_num == jnp.array([0], dtype=jnp.int32)).all()
@@ -1119,7 +1135,7 @@ def test_forced_moves():
             if move_nums[answer_idx] == move_num:
                 # validate that the current board matches all game boards
                 cur_board = expected_boards[answer_idx]
-                if move_num == max_move:
+                if move_num >= max_move + steps_after_max_move - 1:
                     cur_board = _flip_board(cur_board)
                 assert (s._board == cur_board[None,:]).all()
                 answer_idx += 1
