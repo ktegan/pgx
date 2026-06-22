@@ -76,6 +76,104 @@ DICE_ROLL_LOGITS      = jnp.array([jnp.log(2.0 / (DICE_SIDES * DICE_SIDES)) if (
 CHANCE_ACTION_LOGITS  = jnp.concatenate([jnp.full(ACTION_MOVE_LENGTH, -jnp.inf, dtype=jnp.float32), DICE_ROLL_LOGITS])
 EMPTY_ACTION_LOGITS   = jnp.full(ACTION_TOTAL_LENGTH, -jnp.inf, dtype=jnp.float32)
 
+BOARD_DTYPE           = jnp.int8  # can store [-128, 127]
+
+NOOP_ACTION_MASK      = jnp.zeros(ACTION_TOTAL_LENGTH, dtype=jnp.bool_).at[0].set(TRUE)
+BOARD_BAR_MASK        = jnp.zeros(ALL_GAME_POSITIONS, dtype=jnp.bool_).at[BAR_IDX].set(TRUE)
+
+
+def _action_is_noop(action):
+    return (action // DICE_SIDES) == SRC_NO_MOVE
+
+
+def _action_to_src(action: Array) -> Array:
+    """
+    Translate src to board index.  For this function we assume that src is not set to SRC_NO_MOVE.
+        no move,         input: action // 6 == 0, output: -2 (-SOURCE_BOARD_OFFSET)
+        move from bar,   input: action // 6 == 1, output: BAR_IDX
+        move_from board, input: action // 6 >= 2: output: board index (action//6 - 2)
+    """
+    src_part = action // DICE_SIDES
+    return jnp.where(src_part == SRC_BAR, BOARD_DTYPE(BAR_IDX), BOARD_DTYPE(src_part - SRC_BOARD_OFFSET))  # type: ignore
+
+
+def _action_to_die(action: Array):
+    return jnp.where(_action_is_noop(action), BOARD_DTYPE(NO_MOVE), (action % 6 + 1).astype(BOARD_DTYPE))  # transform dice values from [0..5] to [1..6]
+
+
+def _tgt_from_board(src: Array, die: Array) -> Array:
+    """ If the action is a noop (where src equals -SRC_BOARD_OFFSET) we can return anything, we return OFF_IDX. """
+    _is_to_board = (src >= 0) & (src + die < BOARD_LENGTH)
+    return jnp.where(_is_to_board, BOARD_DTYPE(src + die), BOARD_DTYPE(OFF_IDX))  # type: ignore
+
+
+def _calc_tgt(src: Array, die: Array) -> Array:
+    """
+    Translate tgt to board index.  We are either coming in from the
+    bar (src >= BOARD_LENGTH) or from the board (src < BOARD_LENGTH).
+    When we come in from the bar a roll of 1 translates to the first
+    index on the board which is index 0, so we land on index = die - 1.
+    """
+    is_from_bar = (src == BAR_IDX)
+    return jnp.where(is_from_bar, BOARD_DTYPE(die) - 1, _tgt_from_board(src, die))  # type: ignore
+
+
+def _decompose_action(action: Array):
+    """
+    Decompose action to src, die, tgt.
+    action = src*6 + die
+    """
+    src = _action_to_src(action)  # -SRC_BOARD_OFFSET means no-op, 0..BOARD_LENGTH move from board, BAR_IDX move from bar
+    die = _action_to_die(action)  # 1~6
+    tgt = _calc_tgt(src, die)
+    return src, die, tgt
+
+
+def _board_mask_before_src(src: Array):
+    """
+    Set True values for all board values that are before the src index.
+    Src can be BAR_IDX or an index on the board [0 ... BOARD_LENGTH-1].
+    """
+    indices        = jnp.arange(ALL_GAME_POSITIONS, dtype=jnp.int32)
+    src_from_bar   = (src == jnp.int32(BAR_IDX))
+    board_at_bar   = (indices == jnp.int32(BAR_IDX))
+    board_lt_src   = (indices < src[..., jnp.newaxis]) & (indices < jnp.int32(BOARD_LENGTH))
+
+    return (~src_from_bar[..., jnp.newaxis]) & (board_at_bar | board_lt_src)
+
+
+def _initialize_arrays():
+    ONE_MOVE_BOARD_DIFFS = jnp.zeros((ACTION_MOVE_LENGTH, ALL_GAME_POSITIONS), dtype=BOARD_DTYPE)
+
+    action_indices = jnp.arange(ACTION_MOVE_LENGTH, dtype=jnp.int32)
+    ONE_MOVE_SRC, ONE_MOVE_DIE, ONE_MOVE_TGT = jax.vmap(_decompose_action)(action_indices)
+
+    # be careful, src can be negative when action is noop
+    def filter_board_indices(indices):
+        return jnp.where(indices < 0, ALL_GAME_POSITIONS, indices)
+
+    ONE_MOVE_BOARD_DIFFS  = ONE_MOVE_BOARD_DIFFS.at[action_indices, filter_board_indices(ONE_MOVE_SRC)].set(-1)
+    ONE_MOVE_BOARD_DIFFS  = ONE_MOVE_BOARD_DIFFS.at[action_indices, filter_board_indices(ONE_MOVE_TGT)].set(+1)
+
+    ACTION_SRC_BOARD_MASK = jax.vmap(_board_mask_before_src)(ONE_MOVE_SRC)
+
+    return ONE_MOVE_BOARD_DIFFS, ONE_MOVE_SRC, ONE_MOVE_TGT, ONE_MOVE_DIE, ACTION_SRC_BOARD_MASK
+
+
+# ONE_MOVE_BOARD_DIFFS  # ACTION_MOVE_LENGTH x ALL_GAME_POSITIONS
+# ONE_MOVE_SRC          # ACTION_MOVE_LENGTH
+# ONE_MOVE_TGT          # ACTION_MOVE_LENGTH
+# ONE_MOVE_DIE          # ACTION_MOVE_LENGTH
+# ACTION_SRC_BOARD_MASK # ACTION_MOVE_LENGTH x ALL_GAME_POSITIONS
+
+_jit_initialize_arrays = jax.jit(_initialize_arrays)
+ONE_MOVE_BOARD_DIFFS, ONE_MOVE_SRC, ONE_MOVE_TGT, ONE_MOVE_DIE, ACTION_SRC_BOARD_MASK = (
+    _jit_initialize_arrays()
+)
+
+
+OUTSIDE_HOME_BOARD_MASK = _board_mask_before_src(jnp.int32(BOARD_LENGTH - HOME_BOARD_LENGTH))
+
 
 @dataclass
 class State(core.State):
@@ -90,7 +188,7 @@ class State(core.State):
     # --- Backgammon specific ---
     # _board stores an integer for each board points(24), bar(2) and off(2),
     # positive values are the count of black pieces, negative for white
-    _board: Array = jnp.zeros(ALL_GAME_POSITIONS, dtype=jnp.int32)
+    _board: Array = jnp.zeros(ALL_GAME_POSITIONS, dtype=BOARD_DTYPE)
     _dice: Array = jnp.zeros(NUM_DICE, dtype=jnp.int32)  # indices 0 to 5 map to dice rolls 1 through 6
     _playable_dice: Array = jnp.full(MAX_MOVES, NO_MOVE, dtype=jnp.int32)  # playable dice, NO_MOVE used for unusable moves
     _played_dice_num: Array = jnp.int32(0)  # the number of dice played
@@ -160,7 +258,7 @@ def _init(rng: PRNGKey) -> State:
     playable_dice: Array = _set_playable_dice(dice)
     played_dice_num: Array = jnp.int32(0)
     turn: Array = _init_turn(dice)
-    legal_action_mask: Array = _legal_action_mask(board, playable_dice)
+    legal_action_mask: Array = _arr_legal_action_mask(board, playable_dice)
     state = State(  # type: ignore
         current_player=current_player,
         _board=board,
@@ -202,8 +300,7 @@ def _observe(state: State, player_id: Array) -> Array:
     )
 
 
-def _action_is_noop(action):
-    return (action // DICE_SIDES) == SRC_NO_MOVE
+
 
 def _action_is_chance(action):
     return action >= ACTION_MOVE_LENGTH
@@ -265,7 +362,7 @@ def _update_by_action(state: State, action: Array) -> State:
         board = _move(state._board, action)
         played_dice_num = jnp.int32(state._played_dice_num + 1)
         playable_dice = _update_playable_dice(state._playable_dice, state._played_dice_num, state._dice, action)
-        legal_action_mask = _legal_action_mask(board, playable_dice)
+        legal_action_mask = _arr_legal_action_mask(board, playable_dice)
         return state.replace(
             _board=board,
             _played_dice_num=played_dice_num,
@@ -276,7 +373,7 @@ def _update_by_action(state: State, action: Array) -> State:
         roll_idx = action - ACTION_MOVE_LENGTH
         dice = ALL_DICE_PAIRS[roll_idx]
         playable_dice = _set_playable_dice(dice)
-        legal_action_mask = _legal_action_mask(state._board, playable_dice)
+        legal_action_mask = _arr_legal_action_mask(state._board, playable_dice)
         return state.replace(
             _dice=dice,
             _playable_dice=playable_dice,
@@ -305,7 +402,7 @@ def _make_init_board() -> Array:
     """
     Initialize the board based on black's perspective.
     """
-    board: Array = jnp.array(START_POSITIONS, dtype=jnp.int32)  # type: ignore
+    board: Array = jnp.array(START_POSITIONS, dtype=BOARD_DTYPE)  # type: ignore
     return board
 
 
@@ -377,11 +474,94 @@ def _update_playable_dice(
           + (dice[0] != dice[1]) * jnp.where(playable_dice == die_idx, NO_MOVE, playable_dice))
 
 
+def _arr_black_checker_mask(board_arr: Array):
+    """ Return a boolean mask to see where there are Black (+1) or White (-1) checkers. """
+    return board_arr > 0
+
+
+def _arr_is_any_earlier(black_checker_mask: Array, src: Array) -> Array:
+    """
+    Checks that there are no positive values in the board state (black checkers)
+    that overlap with OUTSIDE_HOME_BOARD_MASK.
+    """
+    if src.ndim == 0:
+        return (black_checker_mask & _board_mask_before_src(src)).any(axis=-1)
+    return (black_checker_mask & ACTION_SRC_BOARD_MASK[..., :]).any(axis=-1)
+
+
+def _arr_is_illegal_on_board(board_arr, diff):
+    is_illegal_hit_tgt  = (diff > 0) & (board_arr <= -2)
+    is_illegal_src      = (diff < 0) & (board_arr <= 0)
+    return (is_illegal_hit_tgt | is_illegal_src).any(axis=-1)
+
+
+def _arr_is_illegal_off(black_checker_mask, src, tgt, die):
+    is_off              = (tgt == OFF_IDX)
+    is_any_earlier      = _arr_is_any_earlier(black_checker_mask, src)
+    is_all_home         = ~(black_checker_mask & OUTSIDE_HOME_BOARD_MASK[..., :]).any(axis=-1)
+    is_exact_off        = (BOARD_LENGTH - src) == die
+    return is_off & ((~is_all_home) | ((~is_exact_off) & is_any_earlier))
+
+
+def _arr_apply_diff(board_arr: Array, diff: Array, src: Array, die: Array, tgt: Array) -> Array:
+    """
+    Apply board diffs to board_arr. Wherever diff is positive and board_arr has -1,
+    the board_arr value is treated as 0 (simulating hit/blot removal).
+    """
+    is_illegal_on_board = _arr_is_illegal_on_board(board_arr, diff)
+    black_checker_mask  = _arr_black_checker_mask(board_arr)
+    is_illegal_off      = _arr_is_illegal_off(black_checker_mask, src, tgt, die)
+
+    is_illegal_bar      = (black_checker_mask & BOARD_BAR_MASK[..., :]).any(axis=-1) & (src != BAR_IDX)
+
+    is_illegal          = is_illegal_on_board | is_illegal_off | is_illegal_bar
+
+    is_legal_hit_tgt    = (diff > 0) & (board_arr == -1)
+
+    return ~is_illegal, jnp.where(is_legal_hit_tgt, BOARD_DTYPE(1), board_arr + diff)
+
+
+def _arr_one_and_two_moves(board):
+    """
+    This returns a (ACTION_TOTAL, ACTION_TOTAL, BOARD_LENGTH) array containing
+    all possible boards after two moves.  NOTE: the count of white checkers on
+    the bar (negative value at BAR_IDX + 1) is not updated by this.
+    """
+    one_move_legal, one_move_boards = _arr_apply_diff(board, ONE_MOVE_BOARD_DIFFS, ONE_MOVE_SRC, ONE_MOVE_DIE, ONE_MOVE_TGT)
+    two_move_legal, two_move_boards = _arr_apply_diff(one_move_boards[:, jnp.newaxis, :], ONE_MOVE_BOARD_DIFFS[jnp.newaxis, :, :], ONE_MOVE_SRC, ONE_MOVE_DIE, ONE_MOVE_TGT)
+    return one_move_legal, one_move_boards, two_move_legal, two_move_boards
+
+
+def _arr_legal_action_mask(board: Array, playable_dice: Array) -> Array:
+    one_move_legal, one_move_boards, two_move_legal, two_move_boards = _arr_one_and_two_moves(board)
+
+    sorted_dice = jnp.sort(jnp.where(playable_dice == NO_MOVE, NO_MOVE - 1, playable_dice + 1))
+
+    first_dice  = sorted_dice[-1]  # larger dice
+    second_dice = sorted_dice[-2]  # can be NO_MOVE - 1
+
+    move1_die1_legal   = one_move_legal & (ONE_MOVE_DIE == first_dice)
+    move1_die2_legal   = one_move_legal & (ONE_MOVE_DIE == second_dice)
+
+    move2_die1_legal   = two_move_legal & (ONE_MOVE_DIE == first_dice)[jnp.newaxis, :]
+    move2_die2_legal   = two_move_legal & (ONE_MOVE_DIE == second_dice)[jnp.newaxis, :]
+
+    legal_two_moves    = (move1_die1_legal[:, jnp.newaxis] & move2_die2_legal) | (move1_die2_legal[:, jnp.newaxis] & move2_die1_legal)
+    any_two_moves      = legal_two_moves.any()
+
+    one_move_fallback  = jnp.where(move1_die1_legal.any(), move1_die1_legal, move1_die2_legal)
+    legal_moves        = jnp.where(any_two_moves, legal_two_moves.any(axis=-1), one_move_fallback)
+
+    legal_moves_padded = jnp.pad(legal_moves, (0, ACTION_CHANCE_LENGTH), constant_values=False)
+
+    return jnp.where(legal_moves.any(), legal_moves_padded, NOOP_ACTION_MASK)
+
+
 def _home_board() -> Array:
     """
     black: [18~23], white: [0~5]: Always black's perspective
     """
-    return jnp.arange(BOARD_LENGTH - HOME_BOARD_LENGTH, BOARD_LENGTH, dtype=jnp.int32)  # type: ignore
+    return jnp.arange(BOARD_LENGTH - HOME_BOARD_LENGTH, BOARD_LENGTH, dtype=BOARD_DTYPE)  # type: ignore
 
 
 def _rear_distance(board: Array) -> Array:
@@ -420,47 +600,7 @@ def _exists(board: Array, point: int) -> bool:
     return checkers >= 1  # type: ignore
 
 
-def _action_to_src(action: Array) -> int:
-    """
-    Translate src to board index.  For this function we assume that src is not set to SRC_NO_MOVE.
-        no move,         input: action // 6 == 0, output: -2 (-SOURCE_BOARD_OFFSET)
-        move from bar,   input: action // 6 == 1, output: BAR_IDX
-        move_from board, input: action // 6 >= 2: output: board index (action//6 - 2)
-    """
-    src_part = action // DICE_SIDES
-    return jnp.where(src_part == SRC_BAR, jnp.int32(BAR_IDX), jnp.int32(src_part - SRC_BOARD_OFFSET))  # type: ignore
 
-
-def _action_to_die(action: Array):
-    return action % 6 + 1  # 0~5 -> 1~6
-
-
-def _calc_tgt(src: int, die) -> int:
-    """
-    Translate tgt to board index.  We are either coming in from the
-    bar (src >= BOARD_LENGTH) or from the board (src < BOARD_LENGTH).
-    When we come in from the bar a roll of 1 translates to the first
-    index on the board which is index 0, so we land on index = die - 1.
-    """
-    is_from_bar = (src == BAR_IDX)
-    return jnp.where(is_from_bar, jnp.int32(die) - 1, jnp.int32(_tgt_from_board(src, die)))  # type: ignore
-
-
-def _tgt_from_board(src: int, die: int) -> int:
-    """ If the action is a noop (where src equals -SRC_BOARD_OFFSET) we can return anything, we return OFF_IDX. """
-    _is_to_board = (src >= 0) & (src + die < BOARD_LENGTH)
-    return jnp.where(_is_to_board, jnp.int32(src + die), jnp.int32(OFF_IDX))  # type: ignore
-
-
-def _decompose_action(action: Array):
-    """
-    Decompose action to src, die, tgt.
-    action = src*6 + die
-    """
-    src = _action_to_src(action)  # -SRC_BOARD_OFFSET means no-op, 0..BOARD_LENGTH move from board, BAR_IDX move from bar
-    die = _action_to_die(action)  # 1~6
-    tgt = _calc_tgt(src, die)
-    return src, die, tgt
 
 
 def _is_action_legal(board: Array, action: Array) -> bool:
@@ -638,3 +778,4 @@ def _get_abs_board(state: State) -> Array:
     board: Array = state._board
     turn: Array = state._turn
     return jax.lax.cond(turn == 0, lambda: board, lambda: _flip_board(board))
+

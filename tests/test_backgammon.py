@@ -1,9 +1,20 @@
+from dataclasses import dataclass
+
 import jax
 import jax.numpy as jnp
 
 from pgx.experimental.utils import act_randomly
+from pgx._src.types import Array
+
 from pgx.backgammon import (
+    ONE_MOVE_BOARD_DIFFS,
+    ONE_MOVE_SRC,
+    ONE_MOVE_TGT,
+    ONE_MOVE_DIE,
+    BOARD_DTYPE,
     State,
+    Backgammon,
+    _decompose_action,
     _flip_board,
     _action_to_src,
     _calc_tgt,
@@ -11,8 +22,9 @@ from pgx.backgammon import (
     _change_turn,
     _is_action_legal,
     _is_all_on_home_board,
+    _arr_apply_diff,
+    _arr_one_and_two_moves,
     _is_open,
-    _legal_action_mask,
     _move,
     _rear_distance,
     _roll_init_dice,
@@ -21,7 +33,8 @@ from pgx.backgammon import (
     _no_winning_step,
     _exists,
     _set_playable_dice,
-    Backgammon
+    _board_mask_before_src,
+    _arr_legal_action_mask,
 )
 
 seed = 1701
@@ -30,6 +43,7 @@ env = Backgammon()
 init = jax.jit(env.init)
 step = jax.jit(env.step)
 observe = jax.jit(env.observe)
+_decompose_action = jax.jit(_decompose_action)
 _no_winning_step = jax.jit(_no_winning_step)
 _action_to_src = jax.jit(_action_to_src)
 _calc_tgt = jax.jit(_calc_tgt)
@@ -37,12 +51,15 @@ _calc_win_score = jax.jit(_calc_win_score)
 _change_turn = jax.jit(_change_turn)
 _is_action_legal = jax.jit(_is_action_legal)
 _is_all_on_home_board = jax.jit(_is_all_on_home_board)
+_arr_apply_diff = jax.jit(_arr_apply_diff)
+_arr_one_and_two_moves = jax.jit(_arr_one_and_two_moves)
 _is_open = jax.jit(_is_open)
-_legal_action_mask = jax.jit(_legal_action_mask)
 _move = jax.jit(_move)
 _rear_distance = jax.jit(_rear_distance)
 _exists = jax.jit(_exists)
 _set_playable_dice = jax.jit(_set_playable_dice)
+_board_mask_before_src = jax.jit(_board_mask_before_src)
+_arr_legal_action_mask = jax.jit(_arr_legal_action_mask)
 
 
 def make_test_board():
@@ -51,7 +68,7 @@ def make_test_board():
            0,  0,  0, -2, -1,  0,    0,  0,  0,  0, -5,  0,
         # 12, 13, 14, 15, 16, 17,   18, 19, 20, 21, 22, 23,   24, 25,   26, 27
            0,  0,  0,  0,  0,  0,    0,  5,  1,  2, -3,  0,    0, -4,    7,  0
-    ], dtype=jnp.int32)
+    ], dtype=BOARD_DTYPE)
     return board
 
 
@@ -85,7 +102,7 @@ def make_test_board_use_2_moves_simple():
            0,  0,  0,  0,  0,  0,    1,  0, -2,  0, -2,  0,
         # 12, 13, 14, 15, 16, 17,   18, 19, 20, 21, 22, 23,   24, 25,   26,  27
            0,  0,  0,  1,  0, -2,    0,  0,  2,  0, -2,  0,    0,  0,   11,  -7
-    ], dtype=jnp.int32)
+    ], dtype=BOARD_DTYPE)
 
 """
 黒: + 白: -
@@ -116,7 +133,7 @@ def make_answer_use_2_moves_simple():
              0,  0,  0,  0,  0,  0,    1,  0, -2,  0, -2,  0,
           # 12, 13, 14, 15, 16, 17,   18, 19, 20, 21, 22, 23,   24, 25,   26,  27,    28
              0,  0,  0,  0,  0, -2,    0,  0,  2,  1, -2,  0,    0,  0,   11,  -7,     2],
-    ], dtype=jnp.int32))
+    ], dtype=BOARD_DTYPE))
 
 
 def make_test_board_use_4_moves_simple():
@@ -130,7 +147,7 @@ def make_test_board_use_4_moves_simple():
            0,  0,  0,  0,  0,  0,    0,  0,  0,  0,  0,  0,
         # 12, 13, 14, 15, 16, 17,   18, 19, 20, 21, 22, 23,   24, 25,   26,  27
            0,  0,  0,  1,  0,  0,    0,  0,  2, -1, -2,  0,    0,  0,   12, -12
-    ], dtype=jnp.int32)
+    ], dtype=BOARD_DTYPE)
 
 """
 黒: + 白: -
@@ -162,7 +179,7 @@ def make_answer_use_4_moves_simple():
              0,  0,  0,  0,  0,  0,    0,  0,  0,  0,  0,  0,
           # 12, 13, 14, 15, 16, 17,   18, 19, 20, 21, 22, 23,   24, 25,   26,  27,    28
              0,  0,  0,  0,  0,  0,    0,  0,  2,  0, -2,  1,    0, -1,   12, -12,     4],
-    ], dtype=jnp.int32))
+    ], dtype=BOARD_DTYPE))
 
 
 def make_test_board_use_2_moves_order_matters():
@@ -177,7 +194,7 @@ def make_test_board_use_2_moves_order_matters():
            2, -2, -2,  0, -2, -3,    0,  0,  0,  0,  0,  5,
         # 12, 13, 14, 15, 16, 17,   18, 19, 20, 21, 22, 23,   24, 25,   26, 27
            0,  0,  0, -2,  0,  3,    5,  0,  0, -2, -2,  0,    0,  0,    0,  0
-    ], dtype=jnp.int32)
+    ], dtype=BOARD_DTYPE)
 
 """
 黒: + 白: -
@@ -209,7 +226,7 @@ def make_answer_use_2_moves_order_matters():
              1, -2, -2,  0, -2, -3,    0,  0,  0,  0,  1,  5,
           # 12, 13, 14, 15, 16, 17,   18, 19, 20, 21, 22, 23,   24, 25,   26, 27,     28
              0,  0,  0, -2,  0,  3,    5,  0,  0, -2, -2,  0,    0,  0,    0,  0,     2],
-    ], dtype=jnp.int32))
+    ], dtype=BOARD_DTYPE))
 
 
 def make_test_board_use_1_move_higher_roll():
@@ -223,7 +240,7 @@ def make_test_board_use_1_move_higher_roll():
            1,  0,  0, -2, -1, -2,    0,  0,  0,  4, -2,  5,
         # 12, 13, 14, 15, 16, 17,   18, 19, 20, 21, 22, 23,   24, 25,   26, 27
            0, -2,  0, -2,  0, -2,    5,  0,  0,  0, -2,  0,    0,  0,    0,  0
-    ], dtype=jnp.int32)
+    ], dtype=BOARD_DTYPE)
 
 
 """
@@ -252,7 +269,49 @@ def make_answer_use_1_move_higher_roll():
              0,  0,  0, -2, -1, -2,    1,  0,  0,  4, -2,  5,
           # 12, 13, 14, 15, 16, 17,   18, 19, 20, 21, 22, 23,   24, 25,   26, 27,    28
              0, -2,  0, -2,  0, -2,    5,  0,  0,  0, -2,  0,    0,  0,    0,  0,     1],
-    ], dtype=jnp.int32))
+    ], dtype=BOARD_DTYPE))
+
+
+
+def make_test_board_use_1_move_only_available():
+    """
+    Check a case where only the smaller roll is legal.
+    """
+    return jnp.array([
+        #  0,  1,  2,  3,  4,  5,    6,  7,  8,  9, 10, 11,
+           1,  0,  0, -2, -1,  0,   -2,  0,  0,  4, -2,  5,
+        # 12, 13, 14, 15, 16, 17,   18, 19, 20, 21, 22, 23,   24, 25,   26, 27
+           0, -2,  0, -2,  0, -2,    5,  0,  0,  0, -2,  0,    0,  0,    0,  0
+    ], dtype=BOARD_DTYPE)
+
+
+"""
+黒: + 白: -
+12 13 14 15 16 17  18 19 20 21 22 23
+    -     -     -   +           -
+    -     -     -   +           -
+                    +
+                    +
+                    +
+ 
+ +
+ +     +
+ +     +
+ +  -  +        -         -
+ +  -  +        -      -  -        +
+11 10  9  8  7  6   5  4  3  2  1  0
+Bar
+Off
+"""
+
+
+def make_answer_use_1_move_only_available():
+    return ([4, 6], jnp.array([
+        [ #  0,  1,  2,  3,  4,  5,    6,  7,  8,  9, 10, 11,
+             0,  0,  0, -2,  1,  0,   -2,  0,  0,  4, -2,  5,
+          # 12, 13, 14, 15, 16, 17,   18, 19, 20, 21, 22, 23,   24, 25,   26, 27,    28
+             0, -2,  0, -2,  0, -2,    5,  0,  0,  0, -2,  0,    0, -1,    0,  0,     1],
+    ], dtype=BOARD_DTYPE))
 
 
 
@@ -267,7 +326,7 @@ def make_test_board_use_3_moves_simple():
            0,  0,  0,  0,  0,  1,    0,  0,  0,  1,  0,  0,
         # 12, 13, 14, 15, 16, 17,   18, 19, 20, 21, 22, 23,   24, 25,   26,  27
            0,  0,  0,  0,  0, -2,    0,  0,  0, -1,  2, -2,    0,  0,   11, -10
-    ], dtype=jnp.int32)
+    ], dtype=BOARD_DTYPE)
 
 
 """
@@ -290,7 +349,7 @@ def make_answer_use_3_moves_simple():
              0,  0,  0,  0,  0,  0,    0,  0,  0,  0,  0,  1,
           # 12, 13, 14, 15, 16, 17,   18, 19, 20, 21, 22, 23,   24, 25,   26,  27,    28
              0,  0,  0,  0,  0, -2,    0,  0,  0,  1,  2, -2,    0, -1,   11, -10,     3],
-    ], dtype=jnp.int32))
+    ], dtype=BOARD_DTYPE))
 
 
 def make_test_board_use_4_moves_bear_off_v1():
@@ -305,7 +364,7 @@ def make_test_board_use_4_moves_bear_off_v1():
            0,  0,  0,  0,  0,  0,    0,  0,  0,  1,  0,  0,
         # 12, 13, 14, 15, 16, 17,   18, 19, 20, 21, 22, 23,   24, 25,   26,  27
            0,  0,  0,  0,  0, -1,    0,  0,  2,  0,  0, -2,    0,  0,   12, -12
-    ], dtype=jnp.int32)
+    ], dtype=BOARD_DTYPE)
 
 """
 黒: + 白: -
@@ -338,7 +397,7 @@ def make_answer_use_4_moves_bear_off_v1():
              0,  0,  0,  0,  0,  0,    0,  0,  0,  0,  0,  0,
           # 12, 13, 14, 15, 16, 17,   18, 19, 20, 21, 22, 23,   24, 25,   26,  27,    28
              0,  0,  0,  0,  0,  0,    0,  0,  1,  1,  0, -2,    0, -1,   13, -12,     4],
-    ], dtype=jnp.int32))
+    ], dtype=BOARD_DTYPE))
 
 
 
@@ -351,7 +410,7 @@ def make_test_board_use_4_moves_bear_off_v2():
            0,  0,  0,  0,  0,  0,    0,  0,  0,  0,  1,  0,
         # 12, 13, 14, 15, 16, 17,   18, 19, 20, 21, 22, 23,   24, 25,   26,  27
            0,  0,  0,  0,  0, -1,    0,  0,  0,  2,  0, -2,    0,  0,   12, -12
-    ], dtype=jnp.int32)
+    ], dtype=BOARD_DTYPE)
 
 """
 黒: + 白: -
@@ -384,7 +443,7 @@ def make_answer_use_4_moves_bear_off_v2():
              0,  0,  0,  0,  0,  0,    0,  0,  0,  0,  0,  0,
           # 12, 13, 14, 15, 16, 17,   18, 19, 20, 21, 22, 23,   24, 25,   26,  27,    28
              0,  0,  0,  0,  0, -1,    0,  0,  0,  1,  1, -2,    0,  0,   13, -12,     4],
-    ], dtype=jnp.int32))
+    ], dtype=BOARD_DTYPE))
 
 
 
@@ -399,7 +458,7 @@ def make_test_board_use_2_of_4_moves():
            0,  0,  0,  0,  0,  0,    0,  0,  0,  0,  0,  1,
         # 12, 13, 14, 15, 16, 17,   18, 19, 20, 21, 22, 23,   24, 25,   26,  27
            0,  0,  0,  0,  0,  0,    0,  0,  0,  2,  0, -2,    0,  0,   12, -13
-    ], dtype=jnp.int32)
+    ], dtype=BOARD_DTYPE)
 
 """
 黒: + 白: -
@@ -424,7 +483,7 @@ def make_answer_use_2_of_4_moves():
              0,  0,  0,  0,  0,  0,    0,  0,  0,  0,  0,  0,
           # 12, 13, 14, 15, 16, 17,   18, 19, 20, 21, 22, 23,   24, 25,   26,  27,    28
              0,  0,  0,  0,  0,  0,    0,  1,  0,  2,  0, -2,    0,  0,   12, -13,     2],
-    ], dtype=jnp.int32))
+    ], dtype=BOARD_DTYPE))
 
 
 def make_test_board_use_3_moves_bear_off_v1():
@@ -438,7 +497,7 @@ def make_test_board_use_3_moves_bear_off_v1():
            0,  0,  0,  0,  0,  0,    0,  0,  0,  0,  0,  0,
         # 12, 13, 14, 15, 16, 17,   18, 19, 20, 21, 22, 23,   24, 25,   26,  27
            0,  0,  0,  1,  0,  0,    0,  0,  2,  0,  0, -2,    0,  0,   12, -13
-    ], dtype=jnp.int32)
+    ], dtype=BOARD_DTYPE)
 
 """
 黒: + 白: -
@@ -467,7 +526,7 @@ def make_answer_use_3_moves_bear_off_v1():
              0,  0,  0,  0,  0,  0,    0,  0,  0,  0,  0,  0,
           # 12, 13, 14, 15, 16, 17,   18, 19, 20, 21, 22, 23,   24, 25,   26,  27,    28
              0,  0,  0,  0,  0,  0,    0,  1,  0,  0,  0, -2,    0,  0,   14, -13,     3],
-    ], dtype=jnp.int32))
+    ], dtype=BOARD_DTYPE))
 
 
 def make_test_board_use_3_moves_bear_off_v2():
@@ -482,7 +541,7 @@ def make_test_board_use_3_moves_bear_off_v2():
            0,  0,  0,  0,  0,  0,    0,  0,  0,  0,  0,  0,
         # 12, 13, 14, 15, 16, 17,   18, 19, 20, 21, 22, 23,   24, 25,   26,  27
            0,  0,  0,  0,  0,  1,    1,  0,  0,  0,  0, -2,    0,  0,   13, -13
-    ], dtype=jnp.int32)
+    ], dtype=BOARD_DTYPE)
 
 """
 黒: + 白: -
@@ -503,7 +562,7 @@ def make_answer_use_3_moves_bear_off_v2():
              0,  0,  0,  0,  0,  0,    0,  0,  0,  0,  0,  0,
           # 12, 13, 14, 15, 16, 17,   18, 19, 20, 21, 22, 23,   24, 25,   26,  27,    28
              0,  0,  0,  0,  0,  0,    0,  0,  1,  0,  0, -2,    0,  0,   14, -13,     3],
-    ], dtype=jnp.int32))
+    ], dtype=BOARD_DTYPE))
 
 
 def make_test_board_use_2_moves_bear_off_order_matters():
@@ -519,7 +578,7 @@ def make_test_board_use_2_moves_bear_off_order_matters():
            0,  0,  0,  0,  0,  0,    0,  0,  0,  0,  0,  0,
         # 12, 13, 14, 15, 16, 17,   18, 19, 20, 21, 22, 23,   24, 25,   26,  27
            0,  0,  0,  0,  0,  0,    1,  2,  0,  1,  0, -2,    0,  0,   11, -13
-    ], dtype=jnp.int32)
+    ], dtype=BOARD_DTYPE)
 
 """
 黒: + 白: -
@@ -544,7 +603,7 @@ def make_answer_use_2_moves_bear_off_order_matters():
              0,  0,  0,  0,  0,  0,    0,  0,  0,  0,  0,  0,
           # 12, 13, 14, 15, 16, 17,   18, 19, 20, 21, 22, 23,   24, 25,   26,  27,    28
              0,  0,  0,  0,  0,  0,    0,  1,  0,  1,  1, -2,    0,  0,   12, -13,     2],
-    ], dtype=jnp.int32))
+    ], dtype=BOARD_DTYPE))
 
 
 
@@ -570,7 +629,7 @@ def make_test_state(
 
 def test_flip_board():
     test_board = make_test_board()
-    board: jnp.ndarray = jnp.zeros(28, dtype=jnp.int32)
+    board: jnp.ndarray = jnp.zeros(28, dtype=BOARD_DTYPE)
     board = board.at[4].set(-5)
     board = board.at[3].set(-1)
     board = board.at[2].set(-2)
@@ -633,7 +692,7 @@ def test_change_turn():
     assert state._turn == (_turn + 1) % 2
 
     test_board: jnp.ndarray = make_test_board()
-    board: jnp.ndarray = jnp.zeros(28, dtype=jnp.int32)
+    board: jnp.ndarray = jnp.zeros(28, dtype=BOARD_DTYPE)
     board = board.at[4].set(-5)
     board = board.at[3].set(-1)
     board = board.at[2].set(-2)
@@ -659,7 +718,7 @@ def test_change_turn():
 
 def test_no_op():
     board: jnp.ndarray = make_test_board()
-    legal_action_mask = _legal_action_mask(
+    legal_action_mask = _arr_legal_action_mask(
         board, jnp.array([0, 1, -1, -1], dtype=jnp.int32)
     )
     state = make_test_state(
@@ -679,7 +738,7 @@ def test_step():
     # 白
     board: jnp.ndarray = make_test_board()
     board = _flip_board(board)  # Flipped
-    legal_action_mask = _legal_action_mask(
+    legal_action_mask = _arr_legal_action_mask(
         board, jnp.array([0, 1, -1, -1], dtype=jnp.int32)
     )
     state = make_test_state(
@@ -731,7 +790,7 @@ def test_step():
     
     # black
     board: jnp.ndarray = make_test_board()
-    legal_action_mask = _legal_action_mask(
+    legal_action_mask = _arr_legal_action_mask(
         board, jnp.array([4, 5, -1, -1], dtype=jnp.int32)
     )
     state = make_test_state(
@@ -855,7 +914,6 @@ def test_rear_distance():
 def test_distance_to_goal():
     board = make_test_board()
     # Black
-    turn = jnp.int32(-1)
     src = 23
     assert _distance_to_goal(src) == 1
     src = 10
@@ -937,7 +995,123 @@ def test_move():
     )
 
 
-def test_legal_action():
+def test_board_mask_before_src():
+    # Test scalar input
+    src_scalar = jnp.int32(5)
+    mask_scalar = _board_mask_before_src(src_scalar)
+    assert mask_scalar.shape == (28,)
+    expected_scalar = jnp.zeros(28, dtype=jnp.bool_).at[jnp.array([0, 1, 2, 3, 4, 24])].set(True)
+    assert (mask_scalar == expected_scalar).all()
+
+    # Test 1D array input
+    src_array = jnp.array([5, 24], dtype=jnp.int32)
+    mask_array = _board_mask_before_src(src_array)
+    assert mask_array.shape == (2, 28)
+
+    expected_bar = jnp.zeros(28, dtype=jnp.bool_)
+    assert (mask_array[0] == expected_scalar).all()
+    assert (mask_array[1] == expected_bar).all()
+
+
+def test_arr_apply_diff():
+
+    @dataclass(frozen=True)
+    class CaseApplyDiff:
+        board: Array
+        src: Array
+        tgt: Array
+        die: Array
+        is_hit: Array
+        is_legal: Array
+        description: str
+
+
+    # 28 elements board
+    # orig_board has some -1 and other values
+    orig_board = jnp.array([
+        #  0,  1,  2,  3,  4,  5,    6,  7,  8,  9, 10, 11,
+          -1, -1,  0,  2, -2,  0,   -1,  0,  0,  0,  0,  0,
+        # 12, 13, 14, 15, 16, 17,   18, 19, 20, 21, 22, 23,   24, 25,   26, 27
+           0,  0,  0,  0,  0,  0,    0,  0,  2,  0,  2, -2,    0,  0,   9, -8
+    ], dtype=BOARD_DTYPE)
+
+    home_board    = orig_board.at[3].set(0)
+    bar_board     = home_board.at[24].set(1).at[26].set(8)
+
+    tests = [
+        CaseApplyDiff(board=orig_board,    src=3,  tgt=5,  die=2, is_hit=False, is_legal=True,  description='move with no hit'),
+        CaseApplyDiff(board=orig_board,    src=3,  tgt=6,  die=3, is_hit=True,  is_legal=True,  description='move with legal hit'),
+        CaseApplyDiff(board=orig_board,    src=20, tgt=21, die=1, is_hit=False, is_legal=True,  description='move from one point to another'),
+        CaseApplyDiff(board=home_board,    src=22, tgt=26, die=2, is_hit=False, is_legal=True,  description='move to off with exact die roll'),
+        CaseApplyDiff(board=home_board,    src=20, tgt=26, die=6, is_hit=False, is_legal=True,  description='move to off as farthest back'),
+        CaseApplyDiff(board=home_board,    src=20, tgt=26, die=4, is_hit=False, is_legal=True,  description='move to off as farthest back with exact die roll'),
+        CaseApplyDiff(board=bar_board,     src=24, tgt=2,  die=3, is_hit=False, is_legal=True,  description='come in from the bar onto empty slot'),
+        CaseApplyDiff(board=bar_board,     src=24, tgt=1,  die=2, is_hit=True,  is_legal=True,  description='come in from the bar and hit'),
+        CaseApplyDiff(board=bar_board,     src=24, tgt=3,  die=4, is_hit=False, is_legal=True,  description='come in from the bar and land on black checkers'),
+
+        CaseApplyDiff(board=orig_board,    src=3,  tgt=4,  die=1, is_hit=False, is_legal=False, description='cannot land on index 4'),
+        CaseApplyDiff(board=orig_board,    src=2,  tgt=5,  die=3, is_hit=False, is_legal=False, description='no black checkers on src'),
+        CaseApplyDiff(board=orig_board,    src=22, tgt=26, die=2, is_hit=False, is_legal=False, description='move to off but one checker is not in the home board'),
+        CaseApplyDiff(board=bar_board,     src=22, tgt=26, die=2, is_hit=False, is_legal=False, description='move to off but one checker is on the bar'),
+        CaseApplyDiff(board=home_board,    src=22, tgt=26, die=3, is_hit=False, is_legal=False, description='move to off but roll is not exact and not farthest back'),
+        CaseApplyDiff(board=bar_board,     src=24, tgt=4,  die=5, is_hit=False, is_legal=False, description='come in from bar but cannot land on index 4'),
+    ]
+
+    for cur_test in tests:
+        cur_diff      = jnp.zeros(28, dtype=BOARD_DTYPE).at[cur_test.src].set(-1).at[cur_test.tgt].set(+1)
+        action        = jnp.where(cur_test.src == 24, 6 + cur_test.die - 1, (cur_test.src + 2) * 6 + cur_test.die - 1)
+        src, die, tgt = _decompose_action(action)
+        assert (src == cur_test.src).all(), cur_test.description
+        assert (die == cur_test.die).all(), cur_test.description
+        assert (tgt == cur_test.tgt).all(), cur_test.description
+        assert ((src >= 0) & (src <= 24)).all(), cur_test.description
+        assert (((tgt >= 0) & (tgt < 24)) | (tgt == 26)).all(), cur_test.description
+        assert ((die >= 1) & (die <= 6)).all(), cur_test.description
+        expected_board = cur_test.board + cur_diff
+        if cur_test.is_hit:
+            expected_board = expected_board.at[cur_test.tgt].set(1)
+
+        is_legal, new_board = _arr_apply_diff(cur_test.board, cur_diff, cur_test.src, cur_test.die, cur_test.tgt)
+        assert (is_legal == cur_test.is_legal).all(), cur_test.description
+        assert (new_board == expected_board).all(), cur_test.description
+
+
+def test_arr_one_and_two_moves():
+    orig_board = jnp.array([
+        #  0,  1,  2,  3,  4,  5,    6,  7,  8,  9, 10, 11,
+          -1, -1,  0,  2, -2,  0,   -1,  0,  0,  0,  0,  0,
+        # 12, 13, 14, 15, 16, 17,   18, 19, 20, 21, 22, 23,   24, 25,   26, 27
+           0,  0,  0,  0,  0,  0,    0,  0,  0,  2,  0, -2,    0,  0,   11, -8
+    ], dtype=BOARD_DTYPE)
+
+    one_move_legal, one_move_boards, two_move_legal, two_move_boards = \
+        _arr_one_and_two_moves(orig_board)
+
+    assert one_move_legal.shape == (156,)
+    assert one_move_boards.shape == (156, 28)
+    assert two_move_legal.shape == (156, 156)
+    assert two_move_boards.shape == (156, 156, 28)
+
+    # Let's manually verify a few combinations
+    # For a couple of index pairs (i, j), verify that:
+    # two_move_boards[i, j] matches applying the i-th and j-th diff sequentially
+    expected_one_move_legal, expected_one_move_boards = _arr_apply_diff(orig_board, ONE_MOVE_BOARD_DIFFS, ONE_MOVE_SRC, ONE_MOVE_DIE, ONE_MOVE_TGT)
+    test_actions = list(range((3 + 2) * 6 - 2, (3 + 2) * 6 + 2)) + [(5 + 2) * 6 + 4, (21 + 2) * 6 + 4]
+    for i in test_actions:
+        for j in test_actions:
+            expected_two_move_legal, expected_two_move_board = _arr_apply_diff(expected_one_move_boards[i], ONE_MOVE_BOARD_DIFFS[j], ONE_MOVE_SRC[j], ONE_MOVE_DIE[j], ONE_MOVE_TGT[j])
+            assert (two_move_legal[i, j] == expected_two_move_legal).all()
+            assert (two_move_boards[i, j] == expected_two_move_board).all()
+
+    # if we roll a 3 and move one checker from index 3 we hit a blot,
+    # NOTE this simple function does not update the bar counter when we hit
+    hit_blot = orig_board.at[3].set(1)
+    hit_blot = hit_blot.at[6].set(1)
+    # hit_blot = hit_blot.at[BAR_IDX + 1].set(-1)   # this simple function doesn't do this
+    assert (one_move_boards[(3 + 2) * 6 + 2, :] == hit_blot).all()
+
+
+def test_arr_legal_action():
     board = make_test_board()
     # black rolling a 4 and a 3
     playable_dice = jnp.array([3, 2, -1, -1], dtype=jnp.int32)
@@ -964,7 +1138,7 @@ def test_legal_action():
     ].set(
         True
     )  # 21->off
-    legal_action_mask = _legal_action_mask(board, playable_dice)
+    legal_action_mask = _arr_legal_action_mask(board, playable_dice)
     assert (expected_legal_action_mask == legal_action_mask).all()
 
     playable_dice = jnp.array([5, 5, 5, 5], dtype=jnp.int32)
@@ -972,7 +1146,7 @@ def test_legal_action():
     expected_legal_action_mask = expected_legal_action_mask.at[
         6 * (19 + 2) + 5
     ].set(True)
-    legal_action_mask = _legal_action_mask(board, playable_dice)
+    legal_action_mask = _arr_legal_action_mask(board, playable_dice)
     assert (expected_legal_action_mask == legal_action_mask).all()
 
     # white
@@ -984,17 +1158,17 @@ def test_legal_action():
     expected_legal_action_mask = expected_legal_action_mask.at[6 * 1 + 1].set(
         True
     )
-    legal_action_mask = _legal_action_mask(board, playable_dice)
+    legal_action_mask = _arr_legal_action_mask(board, playable_dice)
     assert (expected_legal_action_mask == legal_action_mask).all()
 
     playable_dice = jnp.array([4, 4, 4, 4], dtype=jnp.int32)
     expected_legal_action_mask = jnp.zeros(
         6 * 26 + 21, dtype=jnp.bool_
     )  # dance
-    expected_legal_action_mask = expected_legal_action_mask.at[0:6].set(
+    expected_legal_action_mask = expected_legal_action_mask.at[0].set(
         True
     )  # only no-op
-    legal_action_mask = _legal_action_mask(board, playable_dice)
+    legal_action_mask = _arr_legal_action_mask(board, playable_dice)
     assert (expected_legal_action_mask == legal_action_mask).all()
 
     board_1 = make_test_board_use_2_moves_simple()
@@ -1003,7 +1177,7 @@ def test_legal_action():
     expected_legal_action_mask = expected_legal_action_mask.at[
         6 * (15 + 2) + 3
     ].set(True)  # only using the 4 at index 15
-    legal_action_mask = _legal_action_mask(board_1, playable_dice)
+    legal_action_mask = _arr_legal_action_mask(board_1, playable_dice)
     assert (expected_legal_action_mask == legal_action_mask).all()
 
 
@@ -1015,9 +1189,8 @@ def test_legal_action():
     expected_legal_action_mask = expected_legal_action_mask.at[
         6 * (19 + 2) + 1
     ].set(True)  # only using the 2 at index 19
-    legal_action_mask = _legal_action_mask(board_1, playable_dice)
+    legal_action_mask = _arr_legal_action_mask(board_1, playable_dice)
     assert (expected_legal_action_mask == legal_action_mask).all()
-
 
 
 def test_forced_moves():
@@ -1026,6 +1199,7 @@ def test_forced_moves():
         (make_test_board_use_4_moves_simple(),                 make_answer_use_4_moves_simple()),
         (make_test_board_use_2_moves_order_matters(),          make_answer_use_2_moves_order_matters()),
         (make_test_board_use_1_move_higher_roll(),             make_answer_use_1_move_higher_roll()),
+        (make_test_board_use_1_move_only_available(),          make_answer_use_1_move_only_available()),
         (make_test_board_use_3_moves_simple(),                 make_answer_use_3_moves_simple()),
         (make_test_board_use_4_moves_bear_off_v1(),            make_answer_use_4_moves_bear_off_v1()),
         (make_test_board_use_4_moves_bear_off_v2(),            make_answer_use_4_moves_bear_off_v2()),
@@ -1067,7 +1241,7 @@ def test_forced_moves():
             dice=jnp.array(dice, dtype=jnp.int32),
             playable_dice=jnp.array(playable_dice, dtype=jnp.int32),
             played_dice_num=jnp.int32(0),
-            legal_action_mask=_legal_action_mask(test_board, playable_dice)
+            legal_action_mask=_arr_legal_action_mask(test_board, playable_dice)
         )
 
         # make a batched version of start_state
@@ -1115,8 +1289,6 @@ def test_forced_moves():
                     # current player has run out of moves and must make a noop move
                     assert (s.current_player == jnp.array([0], dtype=jnp.int32)).all()
                     assert (s._played_dice_num == jnp.array([max_move], dtype=jnp.int32)).all()
-                    #jax.debug.print('DEBUG KEGAN test_num {test_num} move_num {move_num}, dice {dice}, actions {actions}',
-                    #                test_num=_test_num, move_num=move_num, dice=dice, actions=jnp.where(s.legal_action_mask.any(axis=0), size=20, fill_value=-1)[0])
                     assert (~s.legal_action_mask[..., 6:]).all()              # only noop action is allowed
             else:
                 if move_num == max_move + steps_after_max_move:
@@ -1141,23 +1313,22 @@ def test_forced_moves():
                 answer_idx += 1
 
 
-
 def test_calc_win_score():
     # backgammon win by black
-    back_gammon_board = jnp.zeros(28, dtype=jnp.int32)
+    back_gammon_board = jnp.zeros(28, dtype=BOARD_DTYPE)
     back_gammon_board = back_gammon_board.at[26].set(15)
     back_gammon_board = back_gammon_board.at[23].set(-15)  # black on home board
     print(_calc_win_score(back_gammon_board))
     assert _calc_win_score(back_gammon_board) == 3
 
     # gammon win by black
-    gammon_board = jnp.zeros(28, dtype=jnp.int32)
+    gammon_board = jnp.zeros(28, dtype=BOARD_DTYPE)
     gammon_board = gammon_board.at[26].set(15)
     gammon_board = gammon_board.at[7].set(-15)
     assert _calc_win_score(gammon_board) == 2
 
     # single win by black
-    single_board = jnp.zeros(28, dtype=jnp.int32)
+    single_board = jnp.zeros(28, dtype=BOARD_DTYPE)
     single_board = single_board.at[26].set(15)
     single_board = single_board.at[27].set(-3)
     single_board = single_board.at[3].set(-12)
@@ -1165,14 +1336,15 @@ def test_calc_win_score():
 
 
 def test_black_off():
-    board: jnp.ndarray = jnp.zeros(28, dtype=jnp.int32)
+    board: jnp.ndarray = jnp.zeros(28, dtype=BOARD_DTYPE)
     board = board.at[0].set(15)
     playable_dice = jnp.array([3, 2, -1, -1])
-    legal_action_mask = _legal_action_mask(board, playable_dice)
+    legal_action_mask = _arr_legal_action_mask(board, playable_dice)
     print("3, 2", jnp.where(legal_action_mask != 0)[0])
     playable_dice = jnp.array([1, 1, -1, -1])
-    legal_action_mask = _legal_action_mask(board, playable_dice)
+    legal_action_mask = _arr_legal_action_mask(board, playable_dice)
     print("1, 1", jnp.where(legal_action_mask != 0)[0])
+
 
 def test_api():
     import pgx
