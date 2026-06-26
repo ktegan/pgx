@@ -58,4 +58,5 @@ def do_profile():
 
 if __name__ == "__main__":
     main()
+    #generate_svgs('backgammon', parallel_games=512, steps=1000, skip_save=True)
     #do_profile()
