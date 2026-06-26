@@ -35,6 +35,16 @@ from pgx.backgammon import (
     _set_playable_dice,
     _board_mask_before_src,
     _arr_legal_action_mask,
+    _arr_is_illegal_on_board,
+    _arr_is_illegal_off,
+    _make_observation,
+    _observation_to_board,
+    _calc_pip_diff,
+    _calc_made_points,
+    _calc_blots_hit_heuristic,
+    _largest_blocking_prime,
+    _get_backmost_black_checker_pos,
+    _get_backmost_white_checker_pos,
 )
 
 seed = 1701
@@ -60,6 +70,12 @@ _exists = jax.jit(_exists)
 _set_playable_dice = jax.jit(_set_playable_dice)
 _board_mask_before_src = jax.jit(_board_mask_before_src)
 _arr_legal_action_mask = jax.jit(_arr_legal_action_mask)
+_arr_is_illegal_on_board = jax.jit(_arr_is_illegal_on_board)
+_arr_is_illegal_off = jax.jit(_arr_is_illegal_off)
+_calc_pip_diff = jax.jit(_calc_pip_diff)
+_calc_made_points = jax.jit(_calc_made_points)
+_calc_blots_hit_heuristic = jax.jit(_calc_blots_hit_heuristic)
+_largest_blocking_prime = jax.jit(_largest_blocking_prime)
 
 
 def make_test_board():
@@ -80,7 +96,7 @@ def make_test_board():
                        +        -
                        +
                        +
- 
+
     -
     -
     -
@@ -155,9 +171,9 @@ def make_test_board_use_4_moves_simple():
           +               +  -  -
                           +     -
 
- 
+
 11 10  9  8  7  6   5  4  3  2  1  0
-Bar 
+Bar
 Off ++++++++++++  -------------
 """
 
@@ -204,7 +220,7 @@ def make_test_board_use_2_moves_order_matters():
                 +   +
                     +
                     +
- 
+
  +
  +
  +                  -
@@ -251,7 +267,7 @@ def make_test_board_use_1_move_higher_roll():
                     +
                     +
                     +
- 
+
  +
  +     +
  +     +
@@ -293,7 +309,7 @@ def make_test_board_use_1_move_only_available():
                     +
                     +
                     +
- 
+
  +
  +     +
  +     +
@@ -335,7 +351,7 @@ def make_test_board_use_3_moves_simple():
                 -            -  +  -
                 -               +  -
 
- 
+
        +            +
 11 10  9  8  7  6   5  4  3  2  1  0
 Bar
@@ -372,7 +388,7 @@ def make_test_board_use_4_moves_bear_off_v1():
                -1         +        -
                           +        -
 
- 
+
        +
 11 10  9  8  7  6   5  4  3  2  1  0
 Bar
@@ -418,7 +434,7 @@ def make_test_board_use_4_moves_bear_off_v2():
                 -            +     -
                              +     -
 
- 
+
     +
 11 10  9  8  7  6   5  4  3  2  1  0
 Bar
@@ -466,7 +482,7 @@ def make_test_board_use_2_of_4_moves():
                              +     -
                              +     -
 
- 
+
  +
 11 10  9  8  7  6   5  4  3  2  1  0
 Bar
@@ -505,7 +521,7 @@ def make_test_board_use_3_moves_bear_off_v1():
           +               +        -
                           +        -
 
- 
+
 11 10  9  8  7  6   5  4  3  2  1  0
 Bar
 Off ++++++++++++  -------------
@@ -549,7 +565,7 @@ def make_test_board_use_3_moves_bear_off_v2():
                 +   +              -
                                    -
 
- 
+
 11 10  9  8  7  6   5  4  3  2  1  0
 Bar
 Off +++++++++++++ -------------
@@ -586,7 +602,7 @@ def make_test_board_use_2_moves_bear_off_order_matters():
                     +  +     +     -
                        +           -
 
- 
+
 11 10  9  8  7  6   5  4  3  2  1  0
 Bar
 Off ++++++++++++  -------------
@@ -787,7 +803,7 @@ def test_step():
     assert state._played_dice_num == 0
     assert state._turn == 0  # turn changed to black?
     assert state._board.at[23].get() == -1 and state._board.at[25].get() == -2
-    
+
     # black
     board: jnp.ndarray = make_test_board()
     legal_action_mask = _arr_legal_action_mask(
@@ -820,48 +836,177 @@ def test_step():
 
 
 def test_observe():
-    board: jnp.ndarray = make_test_board()
+    # NOTE this does not add up to 15 checkers
+    board: jnp.ndarray = jnp.array([
+        #  0,  1,  2,  3,  4,  5,    6,  7,  8,  9, 10, 11,
+           0,  0,  0, -6,  1,  0,   -3,  0,  0,  0, -5, -2,
+        # 12, 13, 14, 15, 16, 17,   18, 19, 20, 21, 22, 23,   24, 25,   26, 27
+           0,  0,  0,  7, -1,  0,    3,  0,  0,  0,  5,  2,    3, -4,    6, -3
+    ], dtype=BOARD_DTYPE)
 
-    # current_player = white, playable_dice = (1, 2)
+    board_pts = board[0:24]
+
+    # Programmatically build expected features to test _make_observation()
+    exp_pts_1 = jnp.array([1.0 if x == 1 else 0.0 for x in board_pts], dtype=jnp.float32)
+    exp_pts_2 = jnp.array([1.0 if x == 2 else 0.0 for x in board_pts], dtype=jnp.float32)
+    exp_pts_ge3 = jnp.array([1.0 if x >= 3 else 0.0 for x in board_pts], dtype=jnp.float32)
+    exp_pts_excess = jnp.maximum(0.0, (board_pts - 3.0) / 2.0)
+    exp_pts_neg1 = jnp.array([1.0 if x == -1 else 0.0 for x in board_pts], dtype=jnp.float32)
+    exp_pts_neg2 = jnp.array([1.0 if x == -2 else 0.0 for x in board_pts], dtype=jnp.float32)
+    exp_pts_le_neg3 = jnp.array([1.0 if x <= -3 else 0.0 for x in board_pts], dtype=jnp.float32)
+    exp_pts_neg_excess = jnp.maximum(0.0, (-board_pts - 3.0) / 2.0)
+    exp_bar = jnp.abs(board[24:26]) / 2.0
+    exp_off = jnp.abs(board[26:28]) / 15.0  # PLAYER_CHECKERS = 15
+
     state = make_test_state(
-        current_player=jnp.int32(1),
+        current_player=jnp.int32(0),
         board=board,
-        turn=jnp.int32(1),
-        dice=jnp.array([0, 1], dtype=jnp.int32),
-        playable_dice=jnp.array([0, 1, -1, -1], dtype=jnp.int32),
+        turn=jnp.int32(0),
+        dice=jnp.array([2, 2], dtype=jnp.int32),
+        playable_dice=jnp.array([2, 2, 2, -1], dtype=jnp.int32),
+        played_dice_num=jnp.int32(1),
+    )
+    num_playable_dice = jnp.sum(state._playable_dice != -1)
+
+    current_player = 0
+    for player_id in range(2):
+        expected_obs = jnp.concatenate([
+            exp_pts_1, exp_pts_2, exp_pts_ge3, exp_pts_excess,
+            exp_pts_neg1, exp_pts_neg2, exp_pts_le_neg3, exp_pts_neg_excess,
+            exp_bar, exp_off, num_playable_dice / 4.0, jnp.array([1.0 if player_id == current_player else 0.0], dtype=jnp.float32)
+        ], axis=None)
+
+        obs = _make_observation(board, num_playable_dice=num_playable_dice, current_player=current_player, player_id=player_id)
+        assert jnp.allclose(obs, expected_obs)
+
+        reconstructed_match = _observation_to_board(obs)
+        if current_player == player_id:
+            assert (reconstructed_match == board).all()
+            assert jnp.allclose(observe(state), obs)
+        else:
+            assert (reconstructed_match == _flip_board(board)).all()
+
+
+def test_estimate_batch_equity():
+    from pgx.backgammon import SimpleEquityPredictor
+    board = make_test_board()
+    state = make_test_state(
+        current_player=jnp.int32(0),
+        board=board,
+        turn=jnp.int32(0),
+        dice=jnp.array([2, 2], dtype=jnp.int32),
+        playable_dice=jnp.array([-1, -1, -1, -1], dtype=jnp.int32),
         played_dice_num=jnp.int32(0),
     )
-    expected_obs = jnp.concatenate(
-        (board, jnp.array([1, 1, 0, 0, 0, 0])), axis=None
-    )
-    assert (observe(state) == expected_obs).all()
+    obs = observe(state)
 
-    state = make_test_state(
-        current_player=jnp.int32(1),
-        board=board,
-        turn=jnp.int32(1),
-        dice=jnp.array([0, 1], dtype=jnp.int32),
-        playable_dice=jnp.array([1, 1, 1, 1], dtype=jnp.int32),
-        played_dice_num=jnp.int32(0),
-    )
-    expected_obs = jnp.concatenate(
-        (board, jnp.array([0, 4, 0, 0, 0, 0])), axis=None
-    )
-    assert (observe(state) == expected_obs).all()
+    predictor = SimpleEquityPredictor(SimpleEquityPredictor.get_default_config())
+    # Test new observation format [B, 197]
+    equity_new = predictor.eval(obs[jnp.newaxis, :])
+    assert equity_new.shape == (1,)
+    assert jnp.isfinite(equity_new[0])
 
-    # current_player = black, playabl_dice = (2)
-    state = make_test_state(
-        current_player=jnp.int32(1),
-        board=board,
-        turn=jnp.int32(-1),
-        dice=jnp.array([0, 1], dtype=jnp.int32),
-        playable_dice=jnp.array([-1, 1, -1, -1], dtype=jnp.int32),
-        played_dice_num=jnp.int32(0),
-    )
-    expected_obs = jnp.concatenate(
-        (board, jnp.array([0, 1, 0, 0, 0, 0])), axis=None
-    )
-    assert (observe(state) == expected_obs).all()
+
+def test_calc_pip_diff():
+    board: jnp.ndarray = jnp.array([
+        #  0,  1,  2,  3,  4,  5,    6,  7,  8,  9, 10, 11,
+           0,  0,  0, -3,  1,  0,   -2,  0,  0,  0,  3, -2,
+        # 12, 13, 14, 15, 16, 17,   18, 19, 20, 21, 22, 23,   24, 25,   26, 27
+           0,  0,  0,  2, -1,  0,    2,  0,  0,  0, -3,  2,    1, -2,    4, -2
+    ], dtype=BOARD_DTYPE)
+    assert jnp.sum(jnp.clip(board, 0, None)) ==  15
+    assert jnp.sum(jnp.clip(board, None, 0)) == -15
+
+    # Calculate expected pip count for black (me)
+    # point_distances_me = [24, 23, ..., 1]
+    expected_my_pip = (1 * 20) + (3 * 14) + (2 * 9) + (2 * 6) + (2 * 1) + (1 * 25) # 119
+
+    # Calculate expected pip count for white (opponent)
+    # point_distances_opp = [1, 2, ..., 24]
+    expected_opp_pip = (3 * 4) + (2 * 7) + (2 * 12) + (1 * 17) + (3 * 23) + (2 * 25) # 186
+
+    expected_pip_diff = expected_opp_pip - expected_my_pip # 186 - 119 = 67
+
+    pip_diff = _calc_pip_diff(board[jnp.newaxis, :])
+    assert pip_diff[0] == expected_pip_diff
+
+
+def test_calc_made_points():
+    board: jnp.ndarray = jnp.array([
+        #  0,  1,  2,  3,  4,  5,    6,  7,  8,  9, 10, 11,
+           0,  0,  0, -3,  1,  0,   -2,  0,  0,  0,  3, -2,
+        # 12, 13, 14, 15, 16, 17,   18, 19, 20, 21, 22, 23,   24, 25,   26, 27
+           0,  0,  0,  2, -1,  0,    2,  0,  0,  0, -3,  2,    1, -2,    4, -2
+    ], dtype=BOARD_DTYPE)
+    # my home points >= 2 are at: 18 (2), 23 (2). Total = 2 points.
+    # opp home points >= 2 are at: 3 (3). Total = 1 point.
+    my_made, opp_made = _calc_made_points(board[jnp.newaxis, :])
+    assert my_made[0] == 2
+    assert opp_made[0] == 1
+
+
+def test_calc_blots_hit_heuristic():
+    board: jnp.ndarray = jnp.array([
+        #  0,  1,  2,  3,  4,  5,    6,  7,  8,  9, 10, 11,
+           0,  0,  0, -3,  1,  0,   -2,  0,  0,  0,  3, -2,
+        # 12, 13, 14, 15, 16, 17,   18, 19, 20, 21, 22, 23,   24, 25,   26, 27
+           0,  0,  0,  2, -1,  0,    2,  0,  0,  0, -3,  2,    0,  0,    5, -4
+    ], dtype=BOARD_DTYPE)
+
+    my_blots, opp_blots = _calc_blots_hit_heuristic(board[jnp.newaxis, :])
+
+    # blot at index 4 can be hit at distance 2, 7 and 12 ((11 + 6 + 1)/36)
+    assert jnp.allclose(my_blots[0], 18.0 / 36.0)
+
+    # blot at index 16 can be hit at distance 1, 6 and 12 ((11 + 11 + 1)/36)
+    assert jnp.allclose(opp_blots[0], 23.0 / 36.0)
+
+
+def test_calc_blots_bar_hitting():
+    # 1. Opponent has checker on the bar, we have a blot in our home area (point 18)
+    board_my = jnp.zeros(28, dtype=BOARD_DTYPE)
+    board_my = board_my.at[18].set(1)  # my blot at 18
+    board_my = board_my.at[25].set(-1) # opponent checker on the bar
+
+    my_blots, opp_blots = _calc_blots_hit_heuristic(board_my[jnp.newaxis, :])
+    assert jnp.allclose(my_blots[0], 11.0 / 36.0)
+    assert jnp.allclose(opp_blots[0], 0.0)
+
+    # 2. We have a checker on the bar, opponent has a blot in their home area (point 3)
+    board_opp = jnp.zeros(28, dtype=BOARD_DTYPE)
+    board_opp = board_opp.at[3].set(-1) # opponent blot at 3
+    board_opp = board_opp.at[24].set(1)  # my checker on the bar
+
+    my_blots, opp_blots = _calc_blots_hit_heuristic(board_opp[jnp.newaxis, :])
+    assert jnp.allclose(my_blots[0], 0.0)
+    assert jnp.allclose(opp_blots[0], 11.0 / 36.0)
+
+
+def test_largest_blocking_prime():
+    # 1. Test case: Black has a prime of size 3 (points 18, 19, 20)
+    # Opponent's farthest back is at 15
+    board = jnp.zeros(28, dtype=BOARD_DTYPE)
+    board = board.at[10].set(2)
+    board = board.at[11].set(3)
+    board = board.at[12].set(2)
+    board = board.at[13].set(2)
+
+    board = board.at[18].set(2)  # 3 prime (18 - 20) is longest prime after 15
+    board = board.at[19].set(3)
+    board = board.at[20].set(2)
+    board = board.at[21].set(1)
+    board = board.at[22].set(2)
+
+    board = board.at[15].set(-1) # White farthest back checker at 15
+    board = board.at[16].set(-2)
+    board = board.at[17].set(-2)
+    board = board.at[23].set(-1)
+
+    # we give the largest blocking prime regardless of whether any checkers
+    # are behind the prime
+    my_prime, opp_prime, _, _ = _largest_blocking_prime(board[jnp.newaxis, :])
+    assert my_prime[0] == 4
+    assert opp_prime[0] == 2
 
 
 def test_is_open():
@@ -944,7 +1089,7 @@ def test_is_action_legal():
     )  # 19 -> 22: Some whites on 22
     assert not _is_action_legal(
         board, (22 + 2) * 6 + 2
-    )  # 22 -> 25: No black on 22 
+    )  # 22 -> 25: No black on 22
     assert _is_action_legal(board, (19 + 2) * 6 + 5)  # bear off
     assert not _is_action_legal(
         board, (20 + 2) * 6 + 5
@@ -1011,6 +1156,54 @@ def test_board_mask_before_src():
     expected_bar = jnp.zeros(28, dtype=jnp.bool_)
     assert (mask_array[0] == expected_scalar).all()
     assert (mask_array[1] == expected_bar).all()
+
+
+def test_arr_is_illegal_on_board():
+    # Base board: checkers at 3 (2), opponent checkers at 4 (-2), empty at 5 (0), single opponent at 6 (-1)
+    board = jnp.zeros(28, dtype=BOARD_DTYPE)
+    board = board.at[3].set(2)
+    board = board.at[4].set(-2)
+    board = board.at[6].set(-1)
+
+    # Case 1: move from 3 to 5 (empty) -> diff: -1 at 3, +1 at 5
+    diff1 = jnp.zeros(28, dtype=BOARD_DTYPE).at[3].set(-1).at[5].set(1)
+    assert not _arr_is_illegal_on_board(board, diff1)
+
+    # Case 2: move from 3 to 6 (single opponent - blot hit) -> diff: -1 at 3, +1 at 6
+    diff2 = jnp.zeros(28, dtype=BOARD_DTYPE).at[3].set(-1).at[6].set(1)
+    assert not _arr_is_illegal_on_board(board, diff2)
+
+    # Case 3: move from 3 to 4 (occupied by opponent >= 2) -> diff: -1 at 3, +1 at 4
+    diff3 = jnp.zeros(28, dtype=BOARD_DTYPE).at[3].set(-1).at[4].set(1)
+    assert _arr_is_illegal_on_board(board, diff3)
+
+    # Case 4: move from 5 (empty) to 7 (empty) -> diff: -1 at 5, +1 at 7
+    diff4 = jnp.zeros(28, dtype=BOARD_DTYPE).at[5].set(-1).at[7].set(1)
+    assert _arr_is_illegal_on_board(board, diff4)
+
+
+def test_arr_is_illegal_off():
+    # OFF_IDX is 26, BOARD_LENGTH is 24
+
+    # Case 1: Move is not to off (tgt != 26) -> always legal (not illegal off)
+    mask1 = jnp.zeros(28, dtype=jnp.bool_).at[10].set(True) # checker outside home board
+    assert not _arr_is_illegal_off(mask1, jnp.int32(10), jnp.int32(15), jnp.int32(5))
+
+    # Case 2: Move to off, but one checker is outside home board (at index 10)
+    mask2 = jnp.zeros(28, dtype=jnp.bool_).at[10].set(True).at[20].set(True)
+    assert _arr_is_illegal_off(mask2, jnp.int32(20), jnp.int32(26), jnp.int32(4))
+
+    # Case 3: Move to off, all checkers are in home board, not farthest back but uses an exact die
+    mask3 = jnp.zeros(28, dtype=jnp.bool_).at[20].set(True).at[19].set(True)
+    assert not _arr_is_illegal_off(mask3, jnp.int32(20), jnp.int32(26), jnp.int32(4))
+
+    # Case 4: Move to off, all checkers in home board, die is larger, but not farthest back
+    mask4 = jnp.zeros(28, dtype=jnp.bool_).at[18].set(True).at[20].set(True)
+    assert _arr_is_illegal_off(mask4, jnp.int32(20), jnp.int32(26), jnp.int32(5))
+
+    # Case 5: Move to off, all checkers in home board, die is larger, and it IS the farthest back
+    mask5 = jnp.zeros(28, dtype=jnp.bool_).at[20].set(True)
+    assert not _arr_is_illegal_off(mask5, jnp.int32(20), jnp.int32(26), jnp.int32(5))
 
 
 def test_arr_apply_diff():
@@ -1346,7 +1539,101 @@ def test_black_off():
     print("1, 1", jnp.where(legal_action_mask != 0)[0])
 
 
+def test_board_mask_before_src():
+    # Test scalar input
+    src_scalar = jnp.int32(5)
+    mask_scalar = _board_mask_before_src(src_scalar)
+    assert mask_scalar.shape == (28,)
+    expected_scalar = jnp.zeros(28, dtype=jnp.bool_).at[jnp.array([0, 1, 2, 3, 4, 24])].set(True)
+    assert (mask_scalar == expected_scalar).all()
+
+    # Test 1D array input
+    src_array = jnp.array([5, 24], dtype=jnp.int32)
+    mask_array = _board_mask_before_src(src_array)
+    assert mask_array.shape == (2, 28)
+
+    expected_bar = jnp.zeros(28, dtype=jnp.bool_)
+    assert (mask_array[0] == expected_scalar).all()
+    assert (mask_array[1] == expected_bar).all()
+
+
 def test_api():
     import pgx
     env = pgx.make("backgammon")
     pgx.api_test(env, 3, use_key=True)
+
+
+def test_backmost_checker_pos():
+    # 1. Black backmost test
+    # Case A: Checker on the bar (BAR_IDX = 24)
+    board_a = jnp.zeros(28, dtype=BOARD_DTYPE)
+    board_a = board_a.at[24].set(1)
+    board_a = board_a.at[5].set(2)
+    assert _get_backmost_black_checker_pos(board_a) == -1
+
+    # Case B: No checker on the bar, first checker at index 3
+    board_b = jnp.zeros(28, dtype=BOARD_DTYPE)
+    board_b = board_b.at[3].set(2)
+    board_b = board_b.at[10].set(5)
+    assert _get_backmost_black_checker_pos(board_b) == 3
+
+    # Case C: All checkers off the board (or no checkers on the board)
+    board_c = jnp.zeros(28, dtype=BOARD_DTYPE)
+    assert _get_backmost_black_checker_pos(board_c) == 24
+
+    # 2. White backmost test
+    # Case A: Checker on the bar (White bar is index 25)
+    board_d = jnp.zeros(28, dtype=BOARD_DTYPE)
+    board_d = board_d.at[25].set(-1)
+    board_d = board_d.at[15].set(-2)
+    assert _get_backmost_white_checker_pos(board_d) == 24
+
+    # Case B: No checker on the bar, backmost checker at index 19
+    board_e = jnp.zeros(28, dtype=BOARD_DTYPE)
+    board_e = board_e.at[19].set(-2)
+    board_e = board_e.at[10].set(-5)
+    assert _get_backmost_white_checker_pos(board_e) == 19
+
+    # Case C: All checkers off the board (or no checkers on the board)
+    board_f = jnp.zeros(28, dtype=BOARD_DTYPE)
+    assert _get_backmost_white_checker_pos(board_f) == -1
+
+    # 3. Batched test (shape (3, 28))
+    batched_board = jnp.stack([board_a, board_b, board_c], axis=0)
+    assert (_get_backmost_black_checker_pos(batched_board) == jnp.array([-1, 3, 24])).all()
+
+    batched_board_white = jnp.stack([board_d, board_e, board_f], axis=0)
+    assert (_get_backmost_white_checker_pos(batched_board_white) == jnp.array([24, 19, -1])).all()
+
+
+def test_checkers_behind_prime():
+    # Setup board
+    board = jnp.zeros(28, dtype=BOARD_DTYPE)
+
+    # Black prime: 18, 19, 20 (length 3, starting at 18)
+    board = board.at[18].set(2)
+    board = board.at[19].set(2)
+    board = board.at[20].set(2)
+
+    # White checkers behind Black's prime (indices >= 18 or on bar (25))
+    board = board.at[22].set(-2)
+    board = board.at[21].set(-1)
+    board = board.at[25].set(-1)
+    board = board.at[4].set(-1)  # Not behind (4 < 18)
+
+    # White prime: 8, 9 (length 2, ending at 9)
+    board = board.at[8].set(-2)
+    board = board.at[9].set(-2)
+
+    # Black checkers behind White's prime (indices <= 9 or on bar (24))
+    board = board.at[5].set(3)
+    board = board.at[7].set(2)
+    board = board.at[24].set(2)
+    board = board.at[12].set(1)  # Not behind (12 > 9)
+
+    my_prime, opp_prime, my_checkers_behind, opp_checkers_behind = _largest_blocking_prime(board[jnp.newaxis, :])
+
+    assert my_prime[0] == 3
+    assert opp_prime[0] == 2
+    assert my_checkers_behind[0] == 4  # 2 at 22 + 1 at 21 + 1 on bar
+    assert opp_checkers_behind[0] == 7  # 3 at 5 + 2 at 7 + 2 on bar

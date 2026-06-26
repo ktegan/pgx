@@ -45,7 +45,9 @@ NO_MOVE_SUM        = MAX_MOVES * NO_MOVE
 
 IN_GAME_POSITIONS  = BOARD_LENGTH + BAR_POSITIONS
 ALL_GAME_POSITIONS = IN_GAME_POSITIONS + OFF_POSITIONS
-OBSERVATION_SIZE   = ALL_GAME_POSITIONS + DICE_SIDES
+
+BOARD_OBSERVE_PTS  = 8                  # number of observation elements per board point
+OBSERVATION_SIZE   = BOARD_LENGTH * BOARD_OBSERVE_PTS + BAR_POSITIONS + OFF_POSITIONS + 2
 
 START_BOARD        = (2, 0, 0, 0, 0, -5, 0, -3, 0, 0, 0, 5, -5, 0, 0, 0, 3, 0, 5, 0, 0, 0, 0, -2)
 START_POSITIONS    = START_BOARD + (0, 0) + (0, 0)
@@ -157,17 +159,36 @@ def _initialize_arrays():
 
     ACTION_SRC_BOARD_MASK = jax.vmap(_board_mask_before_src)(ONE_MOVE_SRC)
 
-    return ONE_MOVE_BOARD_DIFFS, ONE_MOVE_SRC, ONE_MOVE_TGT, ONE_MOVE_DIE, ACTION_SRC_BOARD_MASK
+    i_indices = jnp.arange(BOARD_LENGTH)[:, jnp.newaxis]
+    j_indices = jnp.arange(BOARD_LENGTH)[jnp.newaxis, :]
+    dists = i_indices - j_indices
+
+    # for the first 7 values give the chance of a direct hit by either dice, for the
+    # remaining values give the chance of a hit with the sum of the two dice
+    prob_map = jnp.array([0.0] + [11.0 / 36.0] * DICE_SIDES + [x / 36.0 for x in reversed(range(1, DICE_SIDES + 1))], dtype=jnp.float32)
+
+    safe_dists = jnp.clip(dists, 0, 12)
+    HIT_DIST_HEURISTIC   = jnp.where((dists > 0) & (dists <= 12), prob_map[safe_dists], 0.0)
+    MADE_POINT_HEURISTIC = jnp.array([0.2, 0.2, 0.2, 0.4, 0.5, 0.5] + [0.4, 0.3, 0.2, 0.2, 0.2, 0.2]
+            + [0.2, 0.2, 0.2, 0.3, 0.4, 0.6] + [1.0, 1.0, 0.9, 0.8, 0.7, 0.7], dtype=jnp.float32)
+
+    return ONE_MOVE_BOARD_DIFFS, ONE_MOVE_SRC, ONE_MOVE_DIE, ONE_MOVE_TGT, ACTION_SRC_BOARD_MASK, HIT_DIST_HEURISTIC, MADE_POINT_HEURISTIC
 
 
-# ONE_MOVE_BOARD_DIFFS  # ACTION_MOVE_LENGTH x ALL_GAME_POSITIONS
-# ONE_MOVE_SRC          # ACTION_MOVE_LENGTH
-# ONE_MOVE_TGT          # ACTION_MOVE_LENGTH
-# ONE_MOVE_DIE          # ACTION_MOVE_LENGTH
-# ACTION_SRC_BOARD_MASK # ACTION_MOVE_LENGTH x ALL_GAME_POSITIONS
+# ONE_MOVE_BOARD_DIFFS  : ACTION_MOVE_LENGTH x ALL_GAME_POSITIONS
+#                         For each action this stores the board state diff that has a single +1 and a single -1
+# ONE_MOVE_SRC          : ACTION_MOVE_LENGTH
+#                         For each action this stores the src board position for the action
+# ONE_MOVE_DIE          : ACTION_MOVE_LENGTH
+#                         For each action this stores the die roll for the action
+# ONE_MOVE_TGT          : ACTION_MOVE_LENGTH
+#                         For each action this stores the target board position for the action
+# ACTION_SRC_BOARD_MASK : ACTION_MOVE_LENGTH x ALL_GAME_POSITIONS
+#                         For each action this stores a mask that is True for all board positions
+#                         before the action src (see _arr_is_any_earlier())
 
 _jit_initialize_arrays = jax.jit(_initialize_arrays)
-ONE_MOVE_BOARD_DIFFS, ONE_MOVE_SRC, ONE_MOVE_TGT, ONE_MOVE_DIE, ACTION_SRC_BOARD_MASK = (
+ONE_MOVE_BOARD_DIFFS, ONE_MOVE_SRC, ONE_MOVE_DIE, ONE_MOVE_TGT, ACTION_SRC_BOARD_MASK, HIT_DIST_HEURISTIC, MADE_POINT_HEURISTIC = (
     _jit_initialize_arrays()
 )
 
@@ -284,22 +305,60 @@ def _step(state: State, action: Array, key) -> State:
     )
 
 
+def _make_observation(board: Array, num_playable_dice: Array, current_player: Array, player_id: Array) -> Array:
+    """
+    Use the gnu backgammon encoding (in eval.c) for the board state which
+    is similar to the encoding used by TD Gammon.
+            afInput[0] = (nc == 1) ? 1.0f : 0.0f;
+            afInput[1] = (nc == 2) ? 1.0f : 0.0f;
+            afInput[2] = (nc >= 3) ? 1.0f : 0.0f;
+            afInput[3] = nc > 3 ? (float) (nc - 3) / 2.0f : 0.0f;
+    """
+    board_pts = board[BOARD_RANGE[0]:BOARD_RANGE[1]]
+    observations = [
+        1.0 * (board_pts == 1),
+        1.0 * (board_pts == 2),
+        1.0 * (board_pts >= 3),
+        1.0 * jnp.maximum(0.0, ((board_pts - 3.0) / 2.0)),
+        1.0 * (board_pts == -1),
+        1.0 * (board_pts == -2),
+        1.0 * (board_pts <= -3),
+        1.0 * jnp.maximum(0.0, ((-board_pts - 3.0) / 2.0)),
+        jnp.abs(board[BAR_RANGE[0]:BAR_RANGE[1]]) / 2.0,
+        jnp.abs(board[OFF_RANGE[0]:OFF_RANGE[1]]) / PLAYER_CHECKERS,
+        num_playable_dice / MAX_MOVES,
+        1.0 * (player_id == current_player),
+    ]
+    return jnp.concatenate(observations, axis=None)
+
+
 def _observe(state: State, player_id: Array) -> Array:
-    """
-    Return observation for player_id which is the board and the dice still
-    remaining to be played (represented in the playable dice count format).
-    """
-    board: Array = state._board
-    playable_dice_count_vec: Array = _to_playable_dice_count(
-        state._playable_dice
-    )  # 6 dim vec which represents the count of playable die.
-    return jax.lax.cond(
-        player_id == state.current_player,
-        lambda: jnp.concatenate((board, playable_dice_count_vec), axis=None),  # type: ignore
-        lambda: jnp.concatenate((board, jnp.zeros(DICE_SIDES, dtype=jnp.int32)), axis=None),  # type: ignore
+    num_playable_dice = jnp.sum(state._playable_dice != NO_MOVE)
+    return _make_observation(state._board, num_playable_dice, state.current_player, player_id)
+
+
+def _observation_to_board(observation: Array) -> Array:
+    BLTH = BOARD_LENGTH
+    BRNG = BOARD_RANGE
+    obs  = observation
+
+    board_pts = (
+         1 * obs[BLTH * 0 + BRNG[0]:BLTH * 0 + BRNG[1]] +
+         2 * obs[BLTH * 1 + BRNG[0]:BLTH * 1 + BRNG[1]] +
+        jnp.where(obs[BLTH * 2 + BRNG[0]:BLTH * 2 + BRNG[1]] > 0.0,
+                 3 + jax.lax.round(2 * obs[BLTH * 3 + BRNG[0]:BLTH * 3 + BRNG[1]]), 0.0) +
+        -1 * obs[BLTH * 4 + BRNG[0]:BLTH * 4 + BRNG[1]] +
+        -2 * obs[BLTH * 5 + BRNG[0]:BLTH * 5 + BRNG[1]] +
+        jnp.where(obs[BLTH * 6 + BRNG[0]:BLTH * 6 + BRNG[1]] > 0.0,
+                -3 - jax.lax.round(2 * obs[BLTH * 7 + BRNG[0]:BLTH * 7 + BRNG[1]]), 0.0)
     )
-
-
+    board = jnp.concatenate([board_pts,
+         jax.lax.round(obs[BLTH * 8 + 0] * 2),
+        -jax.lax.round(obs[BLTH * 8 + 1] * 2),
+         jax.lax.round(obs[BLTH * 8 + 2] * PLAYER_CHECKERS),
+        -jax.lax.round(obs[BLTH * 8 + 3] * PLAYER_CHECKERS)
+    ], axis=None)
+    return jnp.where(observation[OBSERVATION_SIZE - 1] > 0.0, board, _flip_board(board))
 
 
 def _action_is_chance(action):
@@ -482,7 +541,9 @@ def _arr_black_checker_mask(board_arr: Array):
 def _arr_is_any_earlier(black_checker_mask: Array, src: Array) -> Array:
     """
     Checks that there are no positive values in the board state (black checkers)
-    that overlap with OUTSIDE_HOME_BOARD_MASK.
+    that overlap with OUTSIDE_HOME_BOARD_MASK.  NOTE: if src is an array
+    we assume that the last dimension has length ACTION_TOTAL to match
+    ACTION_SRC_BOARD_MASK.
     """
     if src.ndim == 0:
         return (black_checker_mask & _board_mask_before_src(src)).any(axis=-1)
@@ -779,3 +840,267 @@ def _get_abs_board(state: State) -> Array:
     turn: Array = state._turn
     return jax.lax.cond(turn == 0, lambda: board, lambda: _flip_board(board))
 
+
+
+def max_non_zero_idx_or_fallback(arr: Array, fallback: Array):
+    max_idx = (arr.shape[-1] - 1) - jnp.argmax(arr[..., ::-1], axis=-1)
+    return jnp.where(arr.any(axis=-1), max_idx, fallback)
+
+
+def min_non_zero_idx_or_fallback(arr: Array, fallback: Array):
+    min_idx = jnp.argmax(arr, axis=-1)
+    return jnp.where(arr.any(axis=-1), min_idx, fallback)
+
+
+def _get_backmost_black_checker_pos(board: Array) -> Array:
+    """
+    Return the board position for the back most checker for black (smallest index),
+    [-1 ... 24].  If there is a checker on the bar we return -1, if all of the
+    checkers are off the board we return BOARD_LENGTH.
+    """
+    has_checkers = (board[..., :BOARD_LENGTH] > 0)
+    bar_idx      = BAR_IDX
+    bar_position = -1
+    has_bar_checkers = (board[..., bar_idx] > 0)
+    return jnp.where(has_bar_checkers, bar_position, min_non_zero_idx_or_fallback(has_checkers, BOARD_LENGTH))
+
+
+def _get_backmost_white_checker_pos(board: Array) -> Array:
+    """
+    Return the board position for the back most checker for white (largest index),
+    [-1 ... 24].  If there is a checker on the bar we return BOARD_LENGTH, if all of the
+    checkers are off the board we return -1.
+    """
+    has_checkers = (board[..., :BOARD_LENGTH] < 0)
+    bar_idx      = BAR_IDX + 1
+    bar_position = BOARD_LENGTH
+    has_bar_checkers = (board[..., bar_idx] < 0)
+    return jnp.where(has_bar_checkers, bar_position, max_non_zero_idx_or_fallback(has_checkers, -1))
+
+
+def _is_end_game(board: Array) -> Array:
+    """ See if we are in the phase of the game where contact is no longer possible """
+    return _get_backmost_black_checker_pos(board) > _get_backmost_white_checker_pos(board)
+
+
+def _calc_pip_diff(board: Array) -> Array:
+    """ Calculate the pip difference between the two players """
+    my_checkers = jnp.clip(board[..., :BOARD_LENGTH], 0, None)
+    opp_checkers = jnp.clip(-board[..., :BOARD_LENGTH], 0, None)
+    my_bar = board[..., BAR_IDX]
+    opp_bar = -board[..., BAR_IDX + 1]
+
+    point_distances_me = jnp.arange(BOARD_LENGTH, 0, -1)      # 24 down to 1
+    point_distances_opp = jnp.arange(1, BOARD_LENGTH + 1, 1)  # 1 up to 24
+
+    my_pip = jnp.sum(my_checkers * point_distances_me, axis=-1) + (my_bar * (BOARD_LENGTH + 1))
+    opp_pip = jnp.sum(opp_checkers * point_distances_opp, axis=-1) + (opp_bar * (BOARD_LENGTH + 1))
+    return opp_pip - my_pip
+
+
+def _calc_made_points(board: Array) -> tuple[Array, Array]:
+    my_checkers = jnp.clip(board[..., :BOARD_LENGTH], 0, None)
+    opp_checkers = jnp.clip(-board[..., :BOARD_LENGTH], 0, None)
+    my_made_points = jnp.sum(my_checkers[..., BOARD_LENGTH - HOME_BOARD_LENGTH:BOARD_LENGTH] >= 2, axis=-1)
+    opp_made_points = jnp.sum(opp_checkers[..., 0:HOME_BOARD_LENGTH] >= 2, axis=-1)
+    return my_made_points, opp_made_points
+
+
+def _calc_end_game_home_board_count(board: Array) -> tuple[Array, Array]:
+    my_checkers = jnp.clip(board[..., :BOARD_LENGTH], 0, None)
+    opp_checkers = jnp.clip(-board[..., :BOARD_LENGTH], 0, None)
+    my_home_checkers = jnp.sum(my_checkers[..., BOARD_LENGTH - HOME_BOARD_LENGTH:BOARD_LENGTH], axis=-1)
+    opp_home_checkers = jnp.sum(opp_checkers[..., 0:HOME_BOARD_LENGTH], axis=-1)
+    my_off_checkers = board[..., OFF_IDX]
+    opp_off_checkers = -board[..., OFF_IDX + 1]
+    return my_home_checkers + my_off_checkers, opp_home_checkers + opp_off_checkers
+
+
+def _calc_made_points_heuristic(board: Array) -> tuple[Array, Array]:
+    in_end_game = _is_end_game(board)
+
+    my_points   = (board[..., :BOARD_LENGTH] >= 2).astype(jnp.float32)
+    opp_points  = (board[..., :BOARD_LENGTH] <= -2).astype(jnp.float32)
+    my_points_heuristic  = jnp.sum(my_points * MADE_POINT_HEURISTIC, axis=-1)
+    opp_points_heuristic = jnp.sum(opp_points * MADE_POINT_HEURISTIC[::-1], axis=-1)
+    return jnp.where(in_end_game, 0, my_points_heuristic), jnp.where(in_end_game, 0, opp_points_heuristic)
+
+
+def _calc_blots_hit_heuristic(board: Array) -> tuple[Array, Array]:
+    my_checkers = jnp.clip(board[:, :BOARD_LENGTH], 0, None)
+    opp_checkers = jnp.clip(-board[:, :BOARD_LENGTH], 0, None)
+    my_bar = board[:, BAR_IDX]
+    opp_bar = -board[:, BAR_IDX + 1]
+
+    indices = jnp.arange(BOARD_LENGTH)
+    is_my_home = (indices >= BOARD_LENGTH - HOME_BOARD_LENGTH)
+    is_opp_home = (indices < HOME_BOARD_LENGTH)
+
+    is_my_blot = (my_checkers == 1)
+    has_opp = (opp_checkers > 0)
+    bar_hit_my = jnp.where((opp_bar[:, jnp.newaxis] > 0) & is_my_home[jnp.newaxis, :], 11.0 / 36.0, 0.0)
+    prob_my = (has_opp @ HIT_DIST_HEURISTIC) + bar_hit_my
+    my_blots = jnp.sum(is_my_blot * prob_my, axis=-1)
+
+    is_opp_blot = (opp_checkers == 1)
+    has_my = (my_checkers > 0)
+    bar_hit_opp = jnp.where((my_bar[:, jnp.newaxis] > 0) & is_opp_home[jnp.newaxis, :], 11.0 / 36.0, 0.0)
+    prob_opp = (has_my @ HIT_DIST_HEURISTIC.T) + bar_hit_opp
+    opp_blots = jnp.sum(is_opp_blot * prob_opp, axis=-1)
+    return my_blots, opp_blots
+
+
+def _largest_blocking_prime(board: Array) -> tuple[Array, Array, Array, Array]:
+    my_checkers = jnp.clip(board[:, :BOARD_LENGTH], 0, None)
+    opp_checkers = jnp.clip(-board[:, :BOARD_LENGTH], 0, None)
+    my_bar = board[:, BAR_IDX]
+    opp_bar = -board[:, BAR_IDX + 1]
+
+    my_made  = (my_checkers >= 2)
+    opp_made = (opp_checkers >= 2)
+
+    def longest_consecutive_run(mask_batch):
+        inputs = mask_batch.T.astype(jnp.int32)
+        def step(carry, x):
+            next_carry = (carry + 1) * x
+            return next_carry, next_carry
+        init_carry = jnp.zeros(mask_batch.shape[0], dtype=jnp.int32)
+        _, runs = jax.lax.scan(step, init_carry, inputs)
+        runs = runs.T
+        max_len = jnp.max(runs, axis=-1)
+        end_idx = jnp.argmax(runs, axis=-1)
+        start_idx = end_idx - max_len + 1
+        return max_len, start_idx, end_idx
+
+    my_largest, my_start_idx, my_end_idx = longest_consecutive_run(my_made)
+    opp_largest, opp_start_idx, opp_end_idx = longest_consecutive_run(opp_made)
+
+    indices = jnp.arange(BOARD_LENGTH)
+
+    # Opponent (White) checkers behind Black's prime (indices >= my_start_idx)
+    my_is_behind = indices[jnp.newaxis, :] >= my_start_idx[:, jnp.newaxis]
+    my_board_count = jnp.sum(jnp.where(my_is_behind, opp_checkers, 0.0), axis=-1)
+    my_checkers_behind = jnp.where(my_largest > 0, my_board_count + opp_bar, 0.0)
+
+    # Black checkers behind Opponent's prime (indices <= opp_end_idx)
+    opp_is_behind = indices[jnp.newaxis, :] <= opp_end_idx[:, jnp.newaxis]
+    opp_board_count = jnp.sum(jnp.where(opp_is_behind, my_checkers, 0.0), axis=-1)
+    opp_checkers_behind = jnp.where(opp_largest > 0, opp_board_count + my_bar, 0.0)
+
+    return my_largest, opp_largest, my_checkers_behind, opp_checkers_behind
+
+
+def _calc_prime_heuristic(board, checker_offset, prime_reward):
+    my_prime, opp_prime, my_checkers_behind, opp_checkers_behind = _largest_blocking_prime(board)
+
+    prime_reward = jnp.broadcast_to(prime_reward, my_prime.shape + (prime_reward.shape[-1],))
+    my_prime_reward  = prime_reward[jnp.arange(len(my_prime)), my_prime]
+    opp_prime_reward = prime_reward[jnp.arange(len(opp_prime)), opp_prime]
+    return my_prime_reward * (my_checkers_behind + checker_offset), opp_prime_reward * (opp_checkers_behind + checker_offset)
+
+
+def _calc_dancing_heuristic(board):
+    """
+    Chance we are not able to bring a checker off the bar with a pair of dice
+    (called dancing), multiplied by the number of checkers on the bar.
+    """
+    my_bar = board[:, BAR_IDX]
+    opp_bar = -board[:, BAR_IDX + 1]
+    my_made_points, opp_made_points = _calc_made_points(board)
+    my_fraction_blocked  = my_made_points / HOME_BOARD_LENGTH
+    opp_fraction_blocked = opp_made_points / HOME_BOARD_LENGTH
+    my_force_dance_prob  = 1.0 - (1.0 - my_fraction_blocked) ** NUM_DICE
+    opp_force_dance_prob = 1.0 - (1.0 - opp_fraction_blocked) ** NUM_DICE
+    return my_force_dance_prob * opp_bar, opp_force_dance_prob * my_bar
+
+
+def _flexibility_heuristic(board):
+    """ This returns a negative number for points with too many checkers """
+    my_extra_checkers  = jnp.clip(board[:, :BOARD_LENGTH] - 3, 0, None)
+    opp_extra_checkers = jnp.clip(-board[:, :BOARD_LENGTH] - 3, 0, None)
+    my_extra_penalty   = -jnp.sum(my_extra_checkers ** 2)
+    opp_extra_penalty  = -jnp.sum(opp_extra_checkers ** 2)
+    return my_extra_penalty, opp_extra_penalty
+
+
+@dataclass
+class SimpleEquityPredictorConfig:
+    pip_diff_weight: Array = jnp.float32(0.11)
+    born_off_weight: Array = jnp.float32(0.9)
+    made_points_old_weight: Array = jnp.float32(0.54)
+    made_points_weight: Array = jnp.float32(0.51)
+    blots_weight: Array = jnp.float32(0.17)
+    bar_weight: Array = jnp.float32(0.2)
+    end_game_home_board_weight: Array = jnp.float32(0.2)
+    end_game_pip_diff_weight: Array = jnp.float32(1.0)    # pip diff is overriding factor when deciding whether to initiate end game
+    dancing_weight: Array = jnp.float32(0.4)
+    flexibility_weight: Array = jnp.float32(0.59)
+    prime_weight: Array = jnp.float32(1.05)
+    prime_checker_offset: Array = jnp.float32(1.45)
+    prime_reward: Array = jnp.array([0.0, 0.03, 0.06, 0.2, 0.3, 0.5, 1.0, 1.0], dtype=jnp.float32)
+
+
+class SimpleEquityPredictor:
+
+    @classmethod
+    def get_default_config(cls) -> SimpleEquityPredictorConfig:
+        return SimpleEquityPredictorConfig()
+
+    def __init__(self, config):
+        self.config = config
+        assert len(self.config.prime_reward) >= (PLAYER_CHECKERS // 2)
+
+    def eval(self, observations: Array) -> Array:
+        """
+        Input: pgx backgammon observation batch matrix shape [B, OBSERVATION_SIZE]
+        Returns: Roughly estimated equity array shape [B]
+
+        TODO other possible simple features:
+         - smoothly reweight features based on whether we want to race
+           or make contact
+         - feed the probability of being hit into the other features as an expected
+           number of checkers on the bar
+         - in the end game give value to having evenly distributed checkers on
+           as many board positions as possible
+         - extra good to have two or more on the bar
+         - use lower level features like freedom (how much work do your farthest back checkers
+           have to do to get to the end game), some of these are situationally dependent
+           (eg freedom is important if you are ahead in the race)
+        """
+        board = jax.vmap(_observation_to_board)(observations)
+
+        my_bar = board[:, BAR_IDX]
+        opp_bar = -board[:, BAR_IDX + 1]
+        my_born_off = board[:, OFF_IDX]
+        opp_born_off = -board[:, OFF_IDX + 1]
+
+        pip_diff = _calc_pip_diff(board)
+        my_made_points, opp_made_points = _calc_made_points(board)
+        my_points_heuristic, opp_points_heuristic = _calc_made_points_heuristic(board)
+        my_blots, opp_blots = _calc_blots_hit_heuristic(board)
+        my_home_count, opp_home_count = _calc_end_game_home_board_count(board)
+        my_dancing_heuristic, opp_dancing_heuristic = _calc_dancing_heuristic(board)
+        my_flexibility_heuristic, opp_flexibility_heuristic = _flexibility_heuristic(board)
+
+        my_prime_heuristic, opp_prime_heuristic = _calc_prime_heuristic(board, self.config.prime_checker_offset, self.config.prime_reward)
+
+        always = (
+            + (my_born_off - opp_born_off) * self.config.born_off_weight
+        )
+        before_end_game = (
+            + (pip_diff * self.config.pip_diff_weight)
+            + (my_made_points - opp_made_points) * self.config.made_points_old_weight
+            + (my_points_heuristic - opp_points_heuristic) * self.config.made_points_weight
+            + (opp_blots - my_blots) * self.config.blots_weight
+            + (opp_bar - my_bar) * self.config.bar_weight
+            + (my_prime_heuristic - opp_prime_heuristic) * self.config.prime_weight
+            + (my_dancing_heuristic - opp_dancing_heuristic) * self.config.dancing_weight
+            + (my_flexibility_heuristic - opp_flexibility_heuristic) * self.config.flexibility_weight
+        )
+        during_end_game = (
+            + (pip_diff * self.config.end_game_pip_diff_weight)
+            + (my_home_count - opp_home_count) * self.config.end_game_home_board_weight
+        )
+
+        estimated_equity = always + jnp.where(_is_end_game(board), during_end_game, before_end_game)
+        return estimated_equity
