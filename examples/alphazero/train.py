@@ -32,17 +32,23 @@ from pydantic import BaseModel
 
 from network import AZNet
 
+# Initialize distributed environment safely
+try:
+    jax.distributed.initialize()
+except Exception:
+    pass
+
 devices = jax.local_devices()
 num_devices = len(devices)
 
 
 class Config(BaseModel):
-    env_id: pgx.EnvId = "go_9x9"
+    env_id: pgx.EnvId = "backgammon"
     seed: int = 0
     max_num_iters: int = 400
     # network params
-    num_channels: int = 128
-    num_layers: int = 6
+    num_channels: int = 128   # aka filters
+    num_layers: int = 6       # aka residual blocks
     resnet_v2: bool = True
     # selfplay params
     selfplay_batch_size: int = 1024
@@ -60,7 +66,8 @@ class Config(BaseModel):
 
 conf_dict = OmegaConf.from_cli()
 config: Config = Config(**conf_dict)
-print(config)
+if jax.process_index() == 0:
+    print(config)
 
 env = pgx.make(config.env_id)
 baseline = pgx.make_baseline_model(config.env_id + "_v0")
@@ -123,7 +130,7 @@ class SelfplayOutput(NamedTuple):
 @jax.pmap
 def selfplay(model, rng_key: jnp.ndarray) -> SelfplayOutput:
     model_params, model_state = model
-    batch_size = config.selfplay_batch_size // num_devices
+    batch_size = config.selfplay_batch_size // jax.device_count()
 
     def step_fn(state, key) -> SelfplayOutput:
         key1, key2 = jax.random.split(key)
@@ -186,7 +193,7 @@ class Sample(NamedTuple):
 
 @jax.pmap
 def compute_loss_input(data: SelfplayOutput) -> Sample:
-    batch_size = config.selfplay_batch_size // num_devices
+    batch_size = config.selfplay_batch_size // jax.device_count()
     # If episode is truncated, there is no value target
     # So when we compute value loss, we need to mask it
     value_mask = jnp.cumsum(data.terminated[::-1, :], axis=0)[::-1, :] >= 1
@@ -251,7 +258,7 @@ def evaluate(rng_key, my_model):
     my_model_params, my_model_state = my_model
 
     key, subkey = jax.random.split(rng_key)
-    batch_size = config.selfplay_batch_size // num_devices
+    batch_size = config.selfplay_batch_size // jax.device_count()
     keys = jax.random.split(subkey, batch_size)
     state = jax.vmap(env.init)(keys)
 
@@ -276,7 +283,8 @@ def evaluate(rng_key, my_model):
 
 
 if __name__ == "__main__":
-    wandb.init(project="pgx-az", config=config.model_dump())
+    if jax.process_index() == 0:
+        wandb.init(project="pgx-az", config=config.model_dump())
 
     # Initialize model and opt_state
     dummy_state = jax.vmap(env.init)(jax.random.split(jax.random.PRNGKey(0), 2))
@@ -290,7 +298,8 @@ if __name__ == "__main__":
     now = datetime.datetime.now(datetime.timezone(datetime.timedelta(hours=9)))
     now = now.strftime("%Y%m%d%H%M%S")
     ckpt_dir = os.path.join("checkpoints", f"{config.env_id}_{now}")
-    os.makedirs(ckpt_dir, exist_ok=True)
+    if jax.process_index() == 0:
+        os.makedirs(ckpt_dir, exist_ok=True)
 
     # Initialize logging dict
     iteration: int = 0
@@ -298,7 +307,8 @@ if __name__ == "__main__":
     frames: int = 0
     log = {"iteration": iteration, "hours": hours, "frames": frames}
 
-    rng_key = jax.random.PRNGKey(config.seed)
+    host_seed = config.seed + jax.process_index()
+    rng_key = jax.random.PRNGKey(host_seed)
     while True:
         if iteration % config.eval_interval == 0:
             # Evaluation
@@ -315,24 +325,26 @@ if __name__ == "__main__":
             )
 
             # Store checkpoints
-            model_0, opt_state_0 = jax.tree_util.tree_map(lambda x: x[0], (model, opt_state))
-            with open(os.path.join(ckpt_dir, f"{iteration:06d}.ckpt"), "wb") as f:
-                dic = {
-                    "config": config,
-                    "rng_key": rng_key,
-                    "model": jax.device_get(model_0),
-                    "opt_state": jax.device_get(opt_state_0),
-                    "iteration": iteration,
-                    "frames": frames,
-                    "hours": hours,
-                    "pgx.__version__": pgx.__version__,
-                    "env_id": env.id,
-                    "env_version": env.version,
-                }
-                pickle.dump(dic, f)
+            if jax.process_index() == 0:
+                model_0, opt_state_0 = jax.tree_util.tree_map(lambda x: x[0], (model, opt_state))
+                with open(os.path.join(ckpt_dir, f"{iteration:06d}.ckpt"), "wb") as f:
+                    dic = {
+                        "config": config,
+                        "rng_key": rng_key,
+                        "model": jax.device_get(model_0),
+                        "opt_state": jax.device_get(opt_state_0),
+                        "iteration": iteration,
+                        "frames": frames,
+                        "hours": hours,
+                        "pgx.__version__": pgx.__version__,
+                        "env_id": env.id,
+                        "env_version": env.version,
+                    }
+                    pickle.dump(dic, f)
 
-        print(log)
-        wandb.log(log)
+        if jax.process_index() == 0:
+            print(log)
+            wandb.log(log)
 
         if iteration >= config.max_num_iters:
             break
@@ -349,12 +361,13 @@ if __name__ == "__main__":
 
         # Shuffle samples and make minibatches
         samples = jax.device_get(samples)  # (#devices, batch, max_num_steps, ...)
-        frames += samples.obs.shape[0] * samples.obs.shape[1] * samples.obs.shape[2]
+        frames += samples.obs.shape[0] * samples.obs.shape[1] * samples.obs.shape[2] * jax.process_count()
         samples = jax.tree_util.tree_map(lambda x: x.reshape((-1, *x.shape[3:])), samples)
         rng_key, subkey = jax.random.split(rng_key)
         ixs = jax.random.permutation(subkey, jnp.arange(samples.obs.shape[0]))
         samples = jax.tree_util.tree_map(lambda x: x[ixs], samples)  # shuffle
-        num_updates = samples.obs.shape[0] // config.training_batch_size
+        local_training_batch_size = config.training_batch_size // jax.process_count()
+        num_updates = samples.obs.shape[0] // local_training_batch_size
         minibatches = jax.tree_util.tree_map(
             lambda x: x.reshape((num_updates, num_devices, -1) + x.shape[1:]), samples
         )
