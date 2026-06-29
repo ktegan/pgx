@@ -56,15 +56,17 @@ class TrainConfig:
 @dataclasses.dataclass(frozen=True)
 class OptunaConfig:
     num_generations: int = 100
-    trials_per_generation: int = 20
+    trials_per_generation: int = 100
     champion_pool_size: int = 4         # we make a pool of recent champions (one per generation) to evaluate candidates
-    batch_size: int = 4000
-    min_games_per_trial: int = 2000     # minimum number of games to play each optuna trial (split across each champion)
-    max_games_per_trial: int = 20000
+    batch_size: int = 8000
+    min_games_per_trial: int = 20000     # minimum number of games to play each optuna trial (split across each champion)
+    max_games_per_trial: int = 200000
     initial_rng_key: int = 0
     rel_bounds: float = 0.3
     reduction_factor: int = 3
     rolling_history_generations: int = 8   # We feed in trials from recent generations to give the optuna sampler more information
+    target_improvement: float = 0.005
+    target_confidence_bound: float = 0.95  # if the current match scores for a candidate do not include target_improvement at this confidence level then exit early
     mutate_parameters: Optional[Tuple[str]] = None
     freeze_parameters: Optional[Tuple[str]] = None
 
@@ -302,8 +304,8 @@ def run_tournament(env_id:str, model_cls:pgx.core.Base, config: TrainConfig, can
             threshold_val = float(threshold)
             std_diff_val = float(std_diff)
 
-            games_per_candidate = b_idx * games_per_batch * config.num_candidates
-            print(f"    Played batch {b_idx} : N={games_per_candidate} games/candidate (min {config.min_games_per_generation}, max {config.max_games_per_generation}). Best champ vs best non-champ diff = {diff_val:.4f} (threshold = {threshold_val:.4f}, std_diff = {std_diff_val:.4f})")
+            games_per_candidate = b_idx * games_per_batch * (config.num_candidates - 1)
+            print(f"    Played batch {b_idx} : N={games_per_candidate} games/candidate (min {config.min_games_per_generation}, max {config.max_games_per_generation}). Best champ vs best non-champ diff = {diff_val:.4f} (threshold = {threshold_val:.4f}, std_diff = {std_diff_val:.4f}, running_var = {running_var:.4f})")
 
             # Check stopping criteria
             if games_per_candidate >= config.min_games_per_generation and diff_val > threshold_val:
@@ -510,6 +512,7 @@ def optuna_param_search(env_id: str, model_cls: pgx.core.Base, search_config: Op
     prev_k = 0
     prev_dropped_score = 0.0
     will_drop = False
+    z_crit = float(scipy.stats.norm.ppf(search_config.target_confidence_bound))
 
     for generation in range(1, search_config.num_generations + 1):
         rng_key, generation_key = jax.random.split(rng_key)
@@ -562,7 +565,7 @@ def optuna_param_search(env_id: str, model_cls: pgx.core.Base, search_config: Op
                 rng_key, subkey = jax.random.split(rng_key)
 
                 # run one batch of games for the current candidate against the pool of champions
-                batch_scores, _ = play_games_jax(
+                batch_scores, running_var = play_games_jax(
                     search_config.batch_size, env_id, model_cls, subkey, pool_configs_batched, p0_indices, p1_indices
                 )
 
@@ -578,6 +581,16 @@ def optuna_param_search(env_id: str, model_cls: pgx.core.Base, search_config: Op
                     raise optuna.TrialPruned()
                 if N >= search_config.max_games_per_trial:
                     break
+
+                #if N >= search_config.min_games_per_trial:
+                #    # compute the confidence bound on the match scores and see if that is not above
+                #    # the target improvement we can say this match score is very unlikely to be this
+                #    # low if the model had the quality of target_improvement
+                #    std_error = jnp.sqrt(2.0 * running_var / N)
+                #    upper_bound = running_match_scores + z_crit * std_error
+                #    if upper_bound < search_config.target_improvement:
+                #        break
+
 
             return avg_score
 
@@ -671,30 +684,48 @@ def optuna_param_search(env_id: str, model_cls: pgx.core.Base, search_config: Op
 
 
 def main_manual():
-    mult_range = [0.94, 0.97, 0.99, 1.0, 1.01, 1.03, 1.06]
+    config_lst = [
+        SimpleEquityPredictorConfig(),
+        SimpleEquityPredictorConfig(pip_diff_weight=0.7619846, born_off_weight=3.5331979, made_points_home_weight=1.1875409, made_points_weight=3.794492, blots_weight=0.37671456, bar_weight=0.4243179, no_contact_home_board_weight=1.0702081, no_contact_pip_diff_weight=0.8380325, dancing_weight=0.35797894, flexibility_weight=0.8969566, prime_weight=0.5276381, prime_checker_offset=1.3168163, prime_reward=jnp.array([0.  , 0.03, 0.06, 0.2 , 0.3 , 0.5 , 1.  , 1.  ], dtype=jnp.float32)),
+        SimpleEquityPredictorConfig(pip_diff_weight=0.6, born_off_weight=3.50, made_points_home_weight=1.19, made_points_weight=3.8, blots_weight=0.33, blots_hit_weight=0.33, bar_weight=0.42, no_contact_home_board_weight=1.07, no_contact_pip_diff_weight=0.84, dancing_weight=0.36, flexibility_weight=0.90, prime_weight=0.53, prime_checker_offset=1.3, prime_reward=jnp.array([0.0, 0.03, 0.06, 0.2, 0.3, 0.5, 1.0, 1.0], dtype=jnp.float32)),
+        SimpleEquityPredictorConfig(use_no_contact=0.0),
+        SimpleEquityPredictorConfig(pip_diff_weight=0.7619846, born_off_weight=3.5331979, made_points_home_weight=1.1875409, made_points_weight=3.794492, blots_weight=0.37671456, bar_weight=0.4243179, no_contact_home_board_weight=1.0702081, no_contact_pip_diff_weight=0.8380325, dancing_weight=0.35797894, flexibility_weight=0.8969566, prime_weight=0.5276381, prime_checker_offset=1.3168163, prime_reward=jnp.array([0.  , 0.03, 0.06, 0.2 , 0.3 , 0.5 , 1.  , 1.  ], dtype=jnp.float32), use_no_contact=0.0),
+        SimpleEquityPredictorConfig(pip_diff_weight=0.6, born_off_weight=3.50, made_points_home_weight=1.19, made_points_weight=3.8, blots_weight=0.33, blots_hit_weight=0.33, bar_weight=0.42, no_contact_home_board_weight=1.07, no_contact_pip_diff_weight=0.84, dancing_weight=0.36, flexibility_weight=0.90, prime_weight=0.53, prime_checker_offset=1.3, prime_reward=jnp.array([0.0, 0.03, 0.06, 0.2, 0.3, 0.5, 1.0, 1.0], dtype=jnp.float32), use_no_contact=0.0),
+    ]
+    config = TrainConfig(
+        num_generations=1,
+        num_candidates=6,
+        num_champions=1,
+        batch_size=4000,
+        abs_stddev=0.0,
+        rel_stddev=0.03,
+        mutate_field_prob=0.3,
+        p_threshold=0.05,
+        max_games_per_generation=50000,
+        min_games_per_generation=10000,
+        stddev_shrink=0.8,
+        mutate_parameters=None,
+        freeze_parameters=('prime_reward',),
+    )
+    run_tournament('backgammon', SimpleEquityPredictor, config, candidate_config_lst=config_lst)
+    return
+
+    mult_range = [0.0, 0.5, 1.0]
     config_dict = dataclasses.asdict(SimpleEquityPredictorConfig())
-    for i, field in enumerate(config_dict.keys()):
-        config = TrainConfig(
-            num_generations=1,
-            num_candidates=6,
-            num_champions=2,
-            batch_size=4000,
-            abs_stddev=0.0,
-            rel_stddev=0.03,
-            mutate_field_prob=0.3,
-            p_threshold=0.05,
-            max_games_per_generation=50000,
-            min_games_per_generation=2000,
-            stddev_shrink=0.8,
-            mutate_parameters=None,
-            freeze_parameters=('prime_reward',),
-        )
+    mutate_params = [x for x in config_dict.keys()]
+    for i, field in enumerate(mutate_params):
         config_lst = []
         for mult in mult_range:
             cur_config = config_dict.copy()
             cur_config[field] = config_dict[field] * mult
             config_lst.append(SimpleEquityPredictorConfig(**cur_config))
-
+    #config_lst = []
+    #for mult in mult_range:
+    #    cur_config = config_dict.copy()
+    #    for field in ['bar_weight']:
+    #        cur_config[field] = config_dict[field] * mult
+    #    config_lst.append(SimpleEquityPredictorConfig(**cur_config))
+#
         print(f'STARTING FOR {field=}')
         run_tournament('backgammon', SimpleEquityPredictor, config, candidate_config_lst=config_lst)
         print(f'ENDING FOR {field=}')
@@ -703,22 +734,25 @@ def main_manual():
 def main_optuna():
     search_config = OptunaConfig(
         freeze_parameters=('prime_reward',),
+        trials_per_generation=100,
+        #mutate_parameters=('blots_weight', 'blots_hit_weight'),
     )
-    initial_params = SimpleEquityPredictorConfig(
-        pip_diff_weight=jnp.float32(1.0),
-        born_off_weight=jnp.float32(1.0),
-        made_points_old_weight=jnp.float32(1.0),
-        made_points_weight=jnp.float32(1.0),
-        blots_weight=jnp.float32(1.0),
-        bar_weight=jnp.float32(1.0),
-        end_game_home_board_weight=jnp.float32(1.0),
-        end_game_pip_diff_weight=jnp.float32(1.0),
-        dancing_weight=jnp.float32(1.0),
-        flexibility_weight=jnp.float32(1.0),
-        prime_weight=jnp.float32(1.0),
-        prime_checker_offset=jnp.float32(1.0),
-        prime_reward=jnp.array([0.0, 0.03, 0.06, 0.2, 0.3, 0.5, 1.0, 1.0], dtype=jnp.float32)
-    )
+
+    initial_params = SimpleEquityPredictorConfig()
+        #pip_diff_weight=jnp.float32(1.0),
+        #born_off_weight=jnp.float32(1.0),
+        #made_points_home_weight=jnp.float32(1.0),
+        #made_points_weight=jnp.float32(1.0),
+        #blots_weight=jnp.float32(1.0),
+        #bar_weight=jnp.float32(1.0),
+        #no_contact_home_board_weight=jnp.float32(1.0),
+        #no_contact_pip_diff_weight=jnp.float32(1.0),
+        #dancing_weight=jnp.float32(1.0),
+        #flexibility_weight=jnp.float32(1.0),
+        #prime_weight=jnp.float32(1.0),
+        #prime_checker_offset=jnp.float32(1.0),
+        #prime_reward=jnp.array([0.0, 0.03, 0.06, 0.2, 0.3, 0.5, 1.0, 1.0], dtype=jnp.float32)
+    #)
     optuna_param_search('backgammon', SimpleEquityPredictor, search_config, initial_params=initial_params)
 
 

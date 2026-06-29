@@ -15,6 +15,7 @@ from pgx.backgammon import (
     State,
     Backgammon,
     _decompose_action,
+    _to_playable_dice_count,
     _flip_board,
     _action_to_src,
     _calc_tgt,
@@ -38,9 +39,10 @@ from pgx.backgammon import (
     _arr_is_illegal_on_board,
     _arr_is_illegal_off,
     _make_observation,
-    _observation_to_board,
+    _observation_to_board_and_dice,
     _calc_pip_diff,
     _calc_made_points,
+    _calc_blots_heuristic,
     _calc_blots_hit_heuristic,
     _largest_blocking_prime,
     _get_backmost_black_checker_pos,
@@ -54,6 +56,7 @@ init = jax.jit(env.init)
 step = jax.jit(env.step)
 observe = jax.jit(env.observe)
 _decompose_action = jax.jit(_decompose_action)
+_to_playable_dice_count = jax.jit(_to_playable_dice_count)
 _no_winning_step = jax.jit(_no_winning_step)
 _action_to_src = jax.jit(_action_to_src)
 _calc_tgt = jax.jit(_calc_tgt)
@@ -74,6 +77,7 @@ _arr_is_illegal_on_board = jax.jit(_arr_is_illegal_on_board)
 _arr_is_illegal_off = jax.jit(_arr_is_illegal_off)
 _calc_pip_diff = jax.jit(_calc_pip_diff)
 _calc_made_points = jax.jit(_calc_made_points)
+_calc_blots_heuristic = jax.jit(_calc_blots_heuristic)
 _calc_blots_hit_heuristic = jax.jit(_calc_blots_hit_heuristic)
 _largest_blocking_prime = jax.jit(_largest_blocking_prime)
 
@@ -866,25 +870,43 @@ def test_observe():
         playable_dice=jnp.array([2, 2, 2, -1], dtype=jnp.int32),
         played_dice_num=jnp.int32(1),
     )
-    num_playable_dice = jnp.sum(state._playable_dice != -1)
+    playable_dice_count = jnp.array([0, 0, 3, 0, 0, 0], dtype=jnp.int32)
 
     current_player = 0
     for player_id in range(2):
+        at_least_one_playable = (playable_dice_count >= 1).astype(jnp.float32)
+        extra_playable = jnp.clip(playable_dice_count - 1, 0, None) / 3.0
         expected_obs = jnp.concatenate([
             exp_pts_1, exp_pts_2, exp_pts_ge3, exp_pts_excess,
             exp_pts_neg1, exp_pts_neg2, exp_pts_le_neg3, exp_pts_neg_excess,
-            exp_bar, exp_off, num_playable_dice / 4.0, jnp.array([1.0 if player_id == current_player else 0.0], dtype=jnp.float32)
+            exp_bar, exp_off, at_least_one_playable, extra_playable, jnp.array([1.0 if player_id == current_player else 0.0], dtype=jnp.float32)
         ], axis=None)
 
-        obs = _make_observation(board, num_playable_dice=num_playable_dice, current_player=current_player, player_id=player_id)
+        obs = _make_observation(board, playable_dice_count=playable_dice_count, current_player=current_player, player_id=player_id)
         assert jnp.allclose(obs, expected_obs)
 
-        reconstructed_match = _observation_to_board(obs)
+        reconstructed_board, reconstructed_dice = _observation_to_board_and_dice(obs)
         if current_player == player_id:
-            assert (reconstructed_match == board).all()
+            assert (reconstructed_board == board).all()
+            assert jnp.allclose(reconstructed_dice, playable_dice_count)
             assert jnp.allclose(observe(state), obs)
         else:
-            assert (reconstructed_match == _flip_board(board)).all()
+            assert (reconstructed_board == _flip_board(board)).all()
+
+
+def test_to_playable_dice_count():
+    # Example 1: Playable dice: 2, 3, -1, -1 (representing 0-indexed dice 2 and 3, i.e., face values 3 and 4)
+    res1 = _to_playable_dice_count(jnp.array([2, 3, -1, -1], dtype=jnp.int32))
+    assert (res1 == jnp.array([0, 0, 1, 1, 0, 0], dtype=jnp.int32)).all()
+
+    # If the user meant 0-indexed dice 1 and 2 (representing face values 2 and 3)
+    # Example 2: Playable dice: 4, 4, 4, 4 (representing four 4s)
+    res1_alt = _to_playable_dice_count(jnp.array([0, 1, -1, -1], dtype=jnp.int32))
+    assert (res1_alt == jnp.array([1, 1, 0, 0, 0, 0], dtype=jnp.int32)).all()
+
+    # Example 2: Playable dice: 4, 4, 4, 4 (representing four 0-indexed 4s, i.e., face values 5)
+    res2 = _to_playable_dice_count(jnp.array([4, 4, 4, 4], dtype=jnp.int32))
+    assert (res2 == jnp.array([0, 0, 0, 0, 4, 0], dtype=jnp.int32)).all()
 
 
 def test_estimate_batch_equity():
@@ -945,41 +967,93 @@ def test_calc_made_points():
     assert opp_made[0] == 1
 
 
+def test_calc_blots_heuristic():
+    board1 = jnp.zeros(28, dtype=BOARD_DTYPE).at[1].set(1).at[2].set(1).at[3].set(-1).at[]
+    board2 = jnp.zeros(28, dtype=BOARD_DTYPE).at[4].set(-1).at[5].set(-1).at[6].set(-1)
+
+    # 1. Call with a single board (shape 1, 28)
+    my_blots, opp_blots = _calc_blots_heuristic(board1[jnp.newaxis, :])
+    assert my_blots[0] == -2
+    assert opp_blots[0] == -1
+
+    # 2. Call with multiple boards (shape 2, 28)
+    stacked = jnp.stack([board1, board2], axis=0)
+    my_blots, opp_blots = _calc_blots_heuristic(stacked)
+    assert (my_blots == jnp.array([-2, 0])).all()
+    assert (opp_blots == jnp.array([-1, -3])).all()
+
+
 def test_calc_blots_hit_heuristic():
     board: jnp.ndarray = jnp.array([
         #  0,  1,  2,  3,  4,  5,    6,  7,  8,  9, 10, 11,
-           0,  0,  0, -3,  1,  0,   -2,  0,  0,  0,  3, -2,
+           0,  0,  0, -3,  1,  0,   -2,  0,  1,  0,  3, -2,
         # 12, 13, 14, 15, 16, 17,   18, 19, 20, 21, 22, 23,   24, 25,   26, 27
            0,  0,  0,  2, -1,  0,    2,  0,  0,  0, -3,  2,    0,  0,    5, -4
     ], dtype=BOARD_DTYPE)
 
-    my_blots, opp_blots = _calc_blots_hit_heuristic(board[jnp.newaxis, :])
+    # Base danger probabilities
+    my_one_roll = (2.0 * 11.0) / 36.0                       # 4 can be hit in one roll by 6, 8 can be hit in one roll by 11
+    my_two_roll = ((1.0 + 6.0 + 1.0) + (2.0 + 5.0)) / 36.0  # 4 can be hit in two rolls at dist 2, 7 and 12, 8 can be hit at dist 3 and 8
+    opp_one_roll = (2.0 * 11.0) / 36.0                      # 16 can be hit in one roll by 15 and 10
+    opp_two_roll = (5.0 + 5.0 + 1.0) / 36.0                 # 16 can be hit in two rolls at dist 6, 8 and 12
 
-    # blot at index 4 can be hit at distance 2, 7 and 12 ((11 + 6 + 1)/36)
-    assert jnp.allclose(my_blots[0], 18.0 / 36.0)
+    expected_my_values = [-my_two_roll - my_one_roll, -my_one_roll, 0.0, 0.0]
+    expected_opp_values = [-opp_two_roll - opp_one_roll, -opp_one_roll, 0.0, 0.0]
 
-    # blot at index 16 can be hit at distance 1, 6 and 12 ((11 + 11 + 1)/36)
-    assert jnp.allclose(opp_blots[0], 23.0 / 36.0)
+    # Stack 6 test boards: first 3 for opp_bar modifications (danger for me), next 3 for my_bar modifications (danger for opp)
+    test_boards = []
+    for bar_count in range(len(expected_my_values)):
+        test_boards.append(board.at[25].set(-bar_count))
+    for bar_count in range(len(expected_opp_values)):
+        test_boards.append(board.at[24].set(bar_count))
+
+    stacked_boards = jnp.stack(test_boards, axis=0)
+
+    my_blots, opp_blots = _calc_blots_hit_heuristic(stacked_boards)
+
+    # Verify opp_blots (vulnerability to our attack based on my_bar counts)
+    for i, expected_val in enumerate(expected_my_values):
+        assert jnp.allclose(my_blots[i], expected_val, atol=1e-3, rtol=1e-3), f"Failed for my_bar={i}: got {my_blots[i]}, expected {expected_val}"
+
+    # Verify my_blots (our vulnerability to opponent's attack based on opp_bar counts)
+    for i, expected_val in enumerate(expected_opp_values):
+        offset = len(expected_my_values)
+        assert jnp.allclose(opp_blots[offset + i], expected_val, atol=1e-3, rtol=1e-3), f"Failed for opp_bar={-i}: got {opp_blots[offset + i]}, expected {expected_val}"
+
+    # test 1D case
+    my_blots_0, opp_blots_0 = _calc_blots_hit_heuristic(stacked_boards[0])
+    assert jnp.allclose(my_blots_0, my_blots[0], atol=1e-3, rtol=1e-3)
+    assert jnp.allclose(opp_blots_0, opp_blots[0], atol=1e-3, rtol=1e-3)
 
 
 def test_calc_blots_bar_hitting():
     # 1. Opponent has checker on the bar, we have a blot in our home area (point 18)
     board_my = jnp.zeros(28, dtype=BOARD_DTYPE)
     board_my = board_my.at[18].set(1)  # my blot at 18
-    board_my = board_my.at[25].set(-1) # opponent checker on the bar
 
-    my_blots, opp_blots = _calc_blots_hit_heuristic(board_my[jnp.newaxis, :])
-    assert jnp.allclose(my_blots[0], 11.0 / 36.0)
-    assert jnp.allclose(opp_blots[0], 0.0)
+    for bar_checkers in [0, 1, 2, 3]:
+        test_board = board_my.at[25].set(-bar_checkers)  # opponent checker on the bar (opp_bar = 1)
+        my_blots, opp_blots = _calc_blots_hit_heuristic(test_board[jnp.newaxis, :])
+        assert jnp.allclose(opp_blots[0], 0.0)
+        if bar_checkers == 0:
+            assert jnp.allclose(my_blots[0], 0.0)
+        else:
+            assert jnp.allclose(my_blots[0], -11.0 / 36.0)
 
     # 2. We have a checker on the bar, opponent has a blot in their home area (point 3)
     board_opp = jnp.zeros(28, dtype=BOARD_DTYPE)
-    board_opp = board_opp.at[3].set(-1) # opponent blot at 3
-    board_opp = board_opp.at[24].set(1)  # my checker on the bar
+    board_opp = board_opp.at[2].set(-1) # opponent blot at 2
+    board_opp = board_opp.at[3].set(-2) # opponent made point at 3
+    board_opp = board_opp.at[4].set(-1) # opponent blot at 4
 
-    my_blots, opp_blots = _calc_blots_hit_heuristic(board_opp[jnp.newaxis, :])
-    assert jnp.allclose(my_blots[0], 0.0)
-    assert jnp.allclose(opp_blots[0], 11.0 / 36.0)
+    for bar_checkers in [0, 1, 2, 3]:
+        test_board = board_opp.at[24].set(bar_checkers)  # my checker on the bar (my_bar = 1)
+        my_blots, opp_blots = _calc_blots_hit_heuristic(test_board[jnp.newaxis, :])
+        assert jnp.allclose(my_blots[0], 0.0)
+        if bar_checkers == 0:
+            assert jnp.allclose(opp_blots[0], 0.0)
+        else:
+            assert jnp.allclose(opp_blots[0], -2.0 * 11.0 / 36.0)
 
 
 def test_largest_blocking_prime():
@@ -1165,21 +1239,20 @@ def test_arr_is_illegal_on_board():
     board = board.at[4].set(-2)
     board = board.at[6].set(-1)
 
-    # Case 1: move from 3 to 5 (empty) -> diff: -1 at 3, +1 at 5
-    diff1 = jnp.zeros(28, dtype=BOARD_DTYPE).at[3].set(-1).at[5].set(1)
-    assert not _arr_is_illegal_on_board(board, diff1)
+    # We evaluate for all actions since the optimized function uses global constants
+    is_illegal = _arr_is_illegal_on_board(board, ONE_MOVE_BOARD_DIFFS)
 
-    # Case 2: move from 3 to 6 (single opponent - blot hit) -> diff: -1 at 3, +1 at 6
-    diff2 = jnp.zeros(28, dtype=BOARD_DTYPE).at[3].set(-1).at[6].set(1)
-    assert not _arr_is_illegal_on_board(board, diff2)
+    # Case 1: move from 3 to 5 (empty) -> Action: (3+2)*6 + (2-1) = 31
+    assert not is_illegal[31]
 
-    # Case 3: move from 3 to 4 (occupied by opponent >= 2) -> diff: -1 at 3, +1 at 4
-    diff3 = jnp.zeros(28, dtype=BOARD_DTYPE).at[3].set(-1).at[4].set(1)
-    assert _arr_is_illegal_on_board(board, diff3)
+    # Case 2: move from 3 to 6 (single opponent - blot hit) -> Action: (3+2)*6 + (3-1) = 32
+    assert not is_illegal[32]
 
-    # Case 4: move from 5 (empty) to 7 (empty) -> diff: -1 at 5, +1 at 7
-    diff4 = jnp.zeros(28, dtype=BOARD_DTYPE).at[5].set(-1).at[7].set(1)
-    assert _arr_is_illegal_on_board(board, diff4)
+    # Case 3: move from 3 to 4 (occupied by opponent >= 2) -> Action: (3+2)*6 + (1-1) = 30
+    assert is_illegal[30]
+
+    # Case 4: move from 5 (empty) to 7 (empty) -> Action: (5+2)*6 + (2-1) = 43
+    assert is_illegal[43]
 
 
 def test_arr_is_illegal_off():
@@ -1187,23 +1260,23 @@ def test_arr_is_illegal_off():
 
     # Case 1: Move is not to off (tgt != 26) -> always legal (not illegal off)
     mask1 = jnp.zeros(28, dtype=jnp.bool_).at[10].set(True) # checker outside home board
-    assert not _arr_is_illegal_off(mask1, jnp.int32(10), jnp.int32(15), jnp.int32(5))
+    assert (~_arr_is_illegal_off(mask1, jnp.int32(10), jnp.int32(15), jnp.int32(5))).all()
 
     # Case 2: Move to off, but one checker is outside home board (at index 10)
     mask2 = jnp.zeros(28, dtype=jnp.bool_).at[10].set(True).at[20].set(True)
-    assert _arr_is_illegal_off(mask2, jnp.int32(20), jnp.int32(26), jnp.int32(4))
+    assert _arr_is_illegal_off(mask2, jnp.int32(20), jnp.int32(26), jnp.int32(4)).all()
 
     # Case 3: Move to off, all checkers are in home board, not farthest back but uses an exact die
     mask3 = jnp.zeros(28, dtype=jnp.bool_).at[20].set(True).at[19].set(True)
-    assert not _arr_is_illegal_off(mask3, jnp.int32(20), jnp.int32(26), jnp.int32(4))
+    assert (~_arr_is_illegal_off(mask3, jnp.int32(20), jnp.int32(26), jnp.int32(4))).all()
 
     # Case 4: Move to off, all checkers in home board, die is larger, but not farthest back
     mask4 = jnp.zeros(28, dtype=jnp.bool_).at[18].set(True).at[20].set(True)
-    assert _arr_is_illegal_off(mask4, jnp.int32(20), jnp.int32(26), jnp.int32(5))
+    assert (_arr_is_illegal_off(mask4, jnp.int32(20), jnp.int32(26), jnp.int32(5))).all()
 
     # Case 5: Move to off, all checkers in home board, die is larger, and it IS the farthest back
     mask5 = jnp.zeros(28, dtype=jnp.bool_).at[20].set(True)
-    assert not _arr_is_illegal_off(mask5, jnp.int32(20), jnp.int32(26), jnp.int32(5))
+    assert (~_arr_is_illegal_off(mask5, jnp.int32(20), jnp.int32(26), jnp.int32(5))).all()
 
 
 def test_arr_apply_diff():
@@ -1264,8 +1337,9 @@ def test_arr_apply_diff():
         if cur_test.is_hit:
             expected_board = expected_board.at[cur_test.tgt].set(1)
 
-        is_legal, new_board = _arr_apply_diff(cur_test.board, cur_diff, cur_test.src, cur_test.die, cur_test.tgt)
-        assert (is_legal == cur_test.is_legal).all(), cur_test.description
+        is_legal, is_legal_hit_tgt = _arr_apply_diff(cur_test.board, jnp.tile(cur_diff, (156, 1)), cur_test.src, cur_test.die, cur_test.tgt)
+        new_board = jnp.where(is_legal_hit_tgt[action], BOARD_DTYPE(1), cur_test.board + cur_diff)
+        assert is_legal[action] == cur_test.is_legal, cur_test.description
         assert (new_board == expected_board).all(), cur_test.description
 
 
@@ -1277,31 +1351,20 @@ def test_arr_one_and_two_moves():
            0,  0,  0,  0,  0,  0,    0,  0,  0,  2,  0, -2,    0,  0,   11, -8
     ], dtype=BOARD_DTYPE)
 
-    one_move_legal, one_move_boards, two_move_legal, two_move_boards = \
-        _arr_one_and_two_moves(orig_board)
+    one_move_legal, two_move_legal = _arr_one_and_two_moves(orig_board)
 
     assert one_move_legal.shape == (156,)
-    assert one_move_boards.shape == (156, 28)
     assert two_move_legal.shape == (156, 156)
-    assert two_move_boards.shape == (156, 156, 28)
 
     # Let's manually verify a few combinations
-    # For a couple of index pairs (i, j), verify that:
-    # two_move_boards[i, j] matches applying the i-th and j-th diff sequentially
-    expected_one_move_legal, expected_one_move_boards = _arr_apply_diff(orig_board, ONE_MOVE_BOARD_DIFFS, ONE_MOVE_SRC, ONE_MOVE_DIE, ONE_MOVE_TGT)
+    expected_one_move_legal, expected_one_move_hit_tgt = _arr_apply_diff(orig_board, ONE_MOVE_BOARD_DIFFS, ONE_MOVE_SRC, ONE_MOVE_DIE, ONE_MOVE_TGT)
+    expected_one_move_boards = jnp.where(expected_one_move_hit_tgt, BOARD_DTYPE(1), orig_board + ONE_MOVE_BOARD_DIFFS)
+
     test_actions = list(range((3 + 2) * 6 - 2, (3 + 2) * 6 + 2)) + [(5 + 2) * 6 + 4, (21 + 2) * 6 + 4]
     for i in test_actions:
         for j in test_actions:
-            expected_two_move_legal, expected_two_move_board = _arr_apply_diff(expected_one_move_boards[i], ONE_MOVE_BOARD_DIFFS[j], ONE_MOVE_SRC[j], ONE_MOVE_DIE[j], ONE_MOVE_TGT[j])
-            assert (two_move_legal[i, j] == expected_two_move_legal).all()
-            assert (two_move_boards[i, j] == expected_two_move_board).all()
-
-    # if we roll a 3 and move one checker from index 3 we hit a blot,
-    # NOTE this simple function does not update the bar counter when we hit
-    hit_blot = orig_board.at[3].set(1)
-    hit_blot = hit_blot.at[6].set(1)
-    # hit_blot = hit_blot.at[BAR_IDX + 1].set(-1)   # this simple function doesn't do this
-    assert (one_move_boards[(3 + 2) * 6 + 2, :] == hit_blot).all()
+            expected_two_move_legal, _ = _arr_apply_diff(expected_one_move_boards[i], jnp.tile(ONE_MOVE_BOARD_DIFFS[j], (156, 1)), ONE_MOVE_SRC[j], ONE_MOVE_DIE[j], ONE_MOVE_TGT[j])
+            assert two_move_legal[i, j] == expected_two_move_legal[j]
 
 
 def test_arr_legal_action():
