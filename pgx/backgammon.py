@@ -245,6 +245,9 @@ class State(core.State):
         is_start_of_turn = (jnp.sum(self._playable_dice) == NO_MOVE_SUM) & (self._played_dice_num == 0)
         return jnp.where(is_start_of_turn, CHANCE_ACTION_LOGITS, EMPTY_ACTION_LOGITS)
 
+    def observation_chance_elements(self) -> int:
+        return ACTION_CHANCE_LENGTH
+
 
 class Backgammon(core.Env):
     def __init__(self):
@@ -605,9 +608,7 @@ def _arr_apply_diff(board_arr: Array, diff: Array, src: Array, die: Array, tgt: 
 
     is_illegal          = is_illegal_on_board | is_illegal_off | is_illegal_bar
 
-    is_legal_hit_tgt    = (diff > 0) & (board_arr == -1)
-
-    return ~is_illegal, is_legal_hit_tgt
+    return ~is_illegal
 
 
 def _arr_one_and_two_moves(board):
@@ -616,18 +617,19 @@ def _arr_one_and_two_moves(board):
     all possible boards after two moves.  NOTE: the count of white checkers on
     the bar (negative value at BAR_IDX + 1) is not updated by this.
     """
-    one_move_legal, one_move_hit_tgt = _arr_apply_diff(board, ONE_MOVE_BOARD_DIFFS, ONE_MOVE_SRC, ONE_MOVE_DIE, ONE_MOVE_TGT)
+    one_move_legal = _arr_apply_diff(board, ONE_MOVE_BOARD_DIFFS, ONE_MOVE_SRC, ONE_MOVE_DIE, ONE_MOVE_TGT)
+    one_move_hit_tgt = (ONE_MOVE_BOARD_DIFFS > 0) & (board == -1)
 
     # for positions where we just hit set the value to 1, if we don't make this fix the board will
     # be the sum of the hit white checker (-1) and new black checker (+1) and will equal zero (empty position)
     one_move_boards = jnp.where(one_move_hit_tgt, BOARD_DTYPE(1), board + ONE_MOVE_BOARD_DIFFS)
 
-    two_move_legal, _  = _arr_apply_diff(one_move_boards, ONE_MOVE_BOARD_DIFFS, ONE_MOVE_SRC, ONE_MOVE_DIE, ONE_MOVE_TGT)
-    return one_move_legal, two_move_legal
+    two_move_legal  = _arr_apply_diff(one_move_boards, ONE_MOVE_BOARD_DIFFS, ONE_MOVE_SRC, ONE_MOVE_DIE, ONE_MOVE_TGT)
+    return one_move_legal, one_move_boards, two_move_legal
 
 
-def _arr_legal_action_mask(board: Array, playable_dice: Array) -> Array:
-    one_move_legal, two_move_legal = _arr_one_and_two_moves(board)
+def _arr_legal_action_mask_details(board: Array, playable_dice: Array):
+    one_move_legal, one_move_boards, two_move_legal = _arr_one_and_two_moves(board)
 
     sorted_dice = jnp.sort(jnp.where(playable_dice == NO_MOVE, NO_MOVE - 1, playable_dice + 1))
 
@@ -640,11 +642,16 @@ def _arr_legal_action_mask(board: Array, playable_dice: Array) -> Array:
     move2_die1_legal   = two_move_legal & (ONE_MOVE_DIE == first_dice)[jnp.newaxis, :]
     move2_die2_legal   = two_move_legal & (ONE_MOVE_DIE == second_dice)[jnp.newaxis, :]
 
-    legal_two_moves    = (move1_die1_legal[:, jnp.newaxis] & move2_die2_legal) | (move1_die2_legal[:, jnp.newaxis] & move2_die1_legal)
-    any_two_moves      = legal_two_moves.any()
-
+    two_move_legal_w_dice = (move1_die1_legal[:, jnp.newaxis] & move2_die2_legal) | (move1_die2_legal[:, jnp.newaxis] & move2_die1_legal)
     one_move_fallback  = jnp.where(move1_die1_legal.any(), move1_die1_legal, move1_die2_legal)
-    legal_moves        = jnp.where(any_two_moves, legal_two_moves.any(axis=-1), one_move_fallback)
+
+    return one_move_fallback, one_move_boards, two_move_legal_w_dice
+
+
+def _arr_legal_action_mask(board: Array, playable_dice: Array) -> Array:
+    one_move_fallback, one_move_boards, two_move_legal_w_dice = _arr_legal_action_mask_details(board, playable_dice)
+    any_two_moves      = two_move_legal_w_dice.any()
+    legal_moves        = jnp.where(any_two_moves, two_move_legal_w_dice.any(axis=-1), one_move_fallback)
 
     legal_moves_padded = jnp.pad(legal_moves, (0, ACTION_CHANCE_LENGTH), constant_values=False)
 
@@ -1059,16 +1066,24 @@ def _calc_dancing_heuristic(board):
 
 
 def _flexibility_heuristic(board):
-    """ This returns a negative number for points with too many checkers """
-    my_extra_checkers  = jnp.clip(board[:, :BOARD_LENGTH] - 3, 0, None)
-    opp_extra_checkers = jnp.clip(-board[:, :BOARD_LENGTH] - 3, 0, None)
-    my_extra_penalty   = -jnp.sum(my_extra_checkers ** 2)
-    opp_extra_penalty  = -jnp.sum(opp_extra_checkers ** 2)
-    return my_extra_penalty, opp_extra_penalty
+    """ This returns a negative number for points with more than 3 checkers (0.5, 1.5, 2.5, etc) """
+    my_penalty         = -jnp.sum(jnp.clip(0.5 + (board[..., :BOARD_LENGTH] - 4), 0, None), axis=-1)
+    opp_penalty        = -jnp.sum(jnp.clip(0.5 + (-board[..., :BOARD_LENGTH] - 4), 0, None), axis=-1)
+    return my_penalty, opp_penalty
 
 
 @dataclass
-class SimpleEquityPredictorConfig:
+class SimpleBackgammonEvaluatorConfig:
+    pip_diff_weight: Array = jnp.float32(0.05)
+    born_off_weight: Array = jnp.float32(3.5)
+    made_points_home_weight: Array = jnp.float32(1.1)
+    made_points_weight: Array = jnp.float32(5.0)
+    blots_weight: Array = jnp.float32(0.2)
+    bar_weight: Array = jnp.float32(0.25)      # this was not yet updated
+    flexibility_weight: Array = jnp.float32(0.5)
+
+
+
 #    pip_diff_weight: Array = jnp.float32(0.11)
 #    born_off_weight: Array = jnp.float32(0.9)
 #    made_points_home_weight: Array = jnp.float32(0.54)
@@ -1098,34 +1113,61 @@ class SimpleEquityPredictorConfig:
 #    prime_checker_offset: Array = jnp.float32(1.3)
 #    prime_reward: Array = jnp.array([0.0, 0.03, 0.06, 0.2, 0.3, 0.5, 1.0, 1.0], dtype=jnp.float32)
 
-    pip_diff_weight: Array = jnp.float32(0.76)
-    born_off_weight: Array = jnp.float32(2.00)
-    made_points_home_weight: Array = jnp.float32(0.6)
-    made_points_weight: Array = jnp.float32(3.8)
-    blots_weight: Array = jnp.float32(0.1)    # TODO zero
-    blots_hit_weight: Array = jnp.float32(0.1)    # TODO zero
-    bar_weight: Array = jnp.float32(0.1)    # TODO zero
-    no_contact_home_board_weight: Array = jnp.float32(0.5)
-    no_contact_pip_diff_weight: Array = jnp.float32(0.5)
-    dancing_weight: Array = jnp.float32(0.36)
-    flexibility_weight: Array = jnp.float32(0.30)
-    prime_weight: Array = jnp.float32(0.3)
-    prime_checker_offset: Array = jnp.float32(0.6)
-    prime_reward: Array = jnp.array([0.0, 0.03, 0.06, 0.2, 0.3, 0.5, 1.0, 1.0], dtype=jnp.float32)
+#    pip_diff_weight: Array = jnp.float32(0.76)
+#    born_off_weight: Array = jnp.float32(2.00)
+#    made_points_home_weight: Array = jnp.float32(0.6)
+#    made_points_weight: Array = jnp.float32(3.8)
+#    blots_weight: Array = jnp.float32(0.1)    # TODO zero
+#    blots_hit_weight: Array = jnp.float32(0.1)    # TODO zero
+#    bar_weight: Array = jnp.float32(0.1)    # TODO zero
+#    no_contact_home_board_weight: Array = jnp.float32(0.5)
+#    no_contact_pip_diff_weight: Array = jnp.float32(0.5)
+#    dancing_weight: Array = jnp.float32(0.36)
+#    flexibility_weight: Array = jnp.float32(0.30)
+#    prime_weight: Array = jnp.float32(0.3)
+#    prime_checker_offset: Array = jnp.float32(0.6)
+#    prime_reward: Array = jnp.array([0.0, 0.03, 0.06, 0.2, 0.3, 0.5, 1.0, 1.0], dtype=jnp.float32)
 
 
 
-class SimpleEquityPredictor:
+class SimpleBackgammonEvaluator(core.Evaluator):
 
     @classmethod
-    def get_default_config(cls) -> SimpleEquityPredictorConfig:
-        return SimpleEquityPredictorConfig()
+    def get_default_config(cls) -> SimpleBackgammonEvaluatorConfig:
+        return SimpleBackgammonEvaluatorConfig()
 
     def __init__(self, config):
         self.config = config
-        assert self.config.prime_reward.shape[-1] >= (PLAYER_CHECKERS // 2)
 
-    def eval(self, observations: Array) -> Array:
+    def eval(self, state: State) -> Array:
+        # in this case we know the internals of the state so grab the board directly
+        #board, playable_dice_count = jax.vmap(_observation_to_board_and_dice)(state.observations)
+        board = state._board
+
+        my_born_off = board[:, OFF_IDX]
+        opp_born_off = -board[:, OFF_IDX + 1]
+        my_bar_heuristic = -board[:, BAR_IDX]     # negate because having a checker on the bar is bad
+        opp_bar_heuristic = board[:, BAR_IDX + 1]
+
+        pip_diff = _calc_pip_diff(board)
+        my_blots_heuristic, opp_blots_heuristic = _calc_blots_heuristic(board)
+        my_made_points, opp_made_points = _calc_made_points(board)
+        my_points_heuristic, opp_points_heuristic = _calc_made_points_heuristic(board)
+        my_flexibility_heuristic, opp_flexibility_heuristic = _flexibility_heuristic(board)
+
+        estimated_equity = (
+            + (my_born_off - opp_born_off) * self.config.born_off_weight
+            + (pip_diff * self.config.pip_diff_weight)
+            + (my_blots_heuristic - opp_blots_heuristic) * self.config.blots_weight
+            + (my_bar_heuristic - opp_bar_heuristic) * self.config.bar_weight
+            + (my_made_points - opp_made_points) * self.config.made_points_home_weight
+            + (my_points_heuristic - opp_points_heuristic) * self.config.made_points_weight
+            + (my_flexibility_heuristic - opp_flexibility_heuristic) * self.config.flexibility_weight
+        )
+        return estimated_equity
+
+
+    def eval_old(self, observations: Array) -> Array:
         """
         Input: pgx backgammon observation batch matrix shape [B, OBSERVATION_SIZE]
         Returns: Roughly estimated equity array shape [B]
@@ -1181,3 +1223,98 @@ class SimpleEquityPredictor:
 
         estimated_equity = always + jnp.where(_is_no_contact(board), during_no_contact, before_no_contact)
         return estimated_equity
+
+
+def _board_to_observation(board: Array) -> Array:
+    flat_board = board.reshape((-1, 28))
+    dummy_dice = jnp.zeros(6, dtype=jnp.float32)
+    dummy_player = jnp.int32(0)
+    flat_obs = jax.vmap(
+        lambda b: _make_observation(b, dummy_dice, dummy_player, dummy_player)
+    )(flat_board)
+    return flat_obs.reshape(board.shape[:-1] + (OBSERVATION_SIZE,))
+
+
+def _evaluate_boards(boards: Array, mask: Array, model) -> Array:
+    orig_shape = boards.shape[:-1]
+    flat_boards = boards.reshape((-1, ALL_GAME_POSITIONS))
+    dummy_state = State(_board=flat_boards)
+    flat_equities = model.eval(dummy_state)
+    equities = flat_equities.reshape(orig_shape)
+    return jnp.where(mask, equities, jnp.finfo(equities.dtype).min)
+
+
+class BackgammonTwoPlyStrategy(core.Strategy):
+    CHUNK_SIZE = 12
+    NUM_CHUNKS = 13
+
+    def __init__(self, env):
+        self.env = env
+        # if this is not true we need to add code to use padding
+        assert self.CHUNK_SIZE * self.NUM_CHUNKS == ACTION_MOVE_LENGTH
+
+    def get_next_action(self, state: core.State, _rng_key: Array, config, model_cls) -> Array:
+        # Get details from helper
+        one_move_fallback, one_move_boards, two_move_legal_w_dice = \
+            jax.vmap(_arr_legal_action_mask_details)(state._board, state._playable_dice)
+
+        B = state.current_player.shape[0]
+
+        # Broadcast config to B * ACTION_MOVE_LENGTH for 1-ply evaluation
+        broad_config = core.broadcast_config(config, ACTION_MOVE_LENGTH)
+        model_1ply = model_cls(broad_config)
+
+        # Broadcast config to B * CHUNK_SIZE * ACTION_MOVE_LENGTH for 2-ply evaluation
+        config_2ply = core.broadcast_config(config, self.CHUNK_SIZE * ACTION_MOVE_LENGTH)
+        model_2ply = model_cls(config_2ply)
+
+        # 1. 1-move evaluation (using helper)
+        one_move_equities = _evaluate_boards(one_move_boards, one_move_fallback, model_1ply) # shape: (B, 156)
+        best_one_move_action = jnp.argmax(one_move_equities, axis=-1) # shape: (B,)
+
+        # 2. 2-move evaluation in chunks of 12 along the 156 first actions
+        chunk_boards = one_move_boards.transpose((1, 0, 2)).reshape((self.NUM_CHUNKS, self.CHUNK_SIZE, B, ALL_GAME_POSITIONS))
+        chunk_legal = two_move_legal_w_dice.transpose((1, 0, 2)).reshape((self.NUM_CHUNKS, self.CHUNK_SIZE, B, ACTION_MOVE_LENGTH))
+
+        def map_fn(inputs):
+            boards, legal = inputs
+
+            # boards shape: (12, B, 28), aka (CHUNK_SIZE, B, ALL_GAME_POSITIONS)
+            # boards_at_tgt represents the board values at the target position for all 156 actions
+            boards_at_tgt = boards[..., ONE_MOVE_TGT]  # shape: (12, B, 156)
+
+            # A hit occurs if the target has exactly 1 opponent checker (value -1)
+            # Transpose boards_at_tgt to (12, 156, B) and expand to (12, 156, B, 1)
+            is_hit_at_tgt = (boards_at_tgt.transpose((0, 2, 1))[..., jnp.newaxis] == -1)
+
+            # Mask to only apply the hit logic to the specific target index of the action
+            # (ONE_MOVE_BOARD_DIFFS > 0) has shape (156, 28)
+            diff_pos = (ONE_MOVE_BOARD_DIFFS > 0)[jnp.newaxis, :, jnp.newaxis, :] # shape: (1, 156, 1, 28)
+
+            # Combine to shape (12, 156, B, 28)
+            is_hit = is_hit_at_tgt & diff_pos
+
+            two_move_boards = jnp.where(
+                is_hit,
+                BOARD_DTYPE(1),
+                boards[:, jnp.newaxis, :, :] + ONE_MOVE_BOARD_DIFFS[jnp.newaxis, :, jnp.newaxis, :]
+            )
+
+            flat_two_move_boards = two_move_boards.transpose((2, 0, 1, 3)).reshape((B, self.CHUNK_SIZE * ACTION_MOVE_LENGTH, ALL_GAME_POSITIONS))
+            flat_legal = legal.transpose((1, 0, 2)).reshape((B, self.CHUNK_SIZE * ACTION_MOVE_LENGTH))
+
+            flat_equities = _evaluate_boards(flat_two_move_boards, flat_legal, model_2ply) # shape: (B, self.CHUNK_SIZE * ACTION_MOVE_LENGTH)
+
+            chunk_equities = flat_equities.reshape((B, self.CHUNK_SIZE, ACTION_MOVE_LENGTH)).transpose((1, 0, 2))
+            return chunk_equities
+
+        chunked_equities = jax.lax.map(map_fn, (chunk_boards, chunk_legal))
+
+        two_move_equities = chunked_equities.reshape((ACTION_MOVE_LENGTH, B, ACTION_MOVE_LENGTH)).transpose((1, 0, 2))
+
+        best_second_move_equity = jnp.max(two_move_equities, axis=-1)
+        best_two_move_first_action = jnp.argmax(best_second_move_equity, axis=-1) # shape: (B,)
+
+        has_two_moves_legal = two_move_legal_w_dice.any(axis=(1, 2))
+
+        return jnp.where(has_two_moves_legal, best_two_move_first_action, best_one_move_action)

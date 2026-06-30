@@ -2,7 +2,7 @@ from pgx._src.api_test import api_test
 from pgx._src.baseline import BaselineModelId, make_baseline_model
 from pgx._src.types import Array, PRNGKey
 from pgx._src.visualizer import save_svg, save_svg_animation, set_visualization_config
-from pgx.core import Env, EnvId, State, available_envs, make
+from pgx.core import Env, EnvId, State, Strategy, Evaluator, OnePlyStrategy, available_envs, make
 
 __version__ = "2.6.0"
 
@@ -14,6 +14,9 @@ __all__ = [
     "State",
     "Env",
     "EnvId",
+    "Strategy",
+    "Evaluator",
+    "OnePlyStrategy",
     "make",
     "available_envs",
     # visualization

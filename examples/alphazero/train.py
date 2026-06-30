@@ -30,7 +30,7 @@ from omegaconf import OmegaConf
 from pgx.experimental import auto_reset
 from pydantic import BaseModel
 
-from network import AZNet
+from pgx.models.aznet import AZNet
 
 # Initialize distributed environment safely
 try:

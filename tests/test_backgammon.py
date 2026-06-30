@@ -1,3 +1,5 @@
+from pgx.backgammon import BackgammonTwoPlyStrategy
+from collections import namedtuple
 from dataclasses import dataclass
 
 import jax
@@ -11,9 +13,12 @@ from pgx.backgammon import (
     ONE_MOVE_SRC,
     ONE_MOVE_TGT,
     ONE_MOVE_DIE,
+    START_POSITIONS,
     BOARD_DTYPE,
     State,
     Backgammon,
+    SimpleBackgammonEvaluator,
+    BackgammonTwoPlyStrategy,
     _decompose_action,
     _to_playable_dice_count,
     _flip_board,
@@ -910,7 +915,7 @@ def test_to_playable_dice_count():
 
 
 def test_estimate_batch_equity():
-    from pgx.backgammon import SimpleEquityPredictor
+    from pgx.backgammon import SimpleBackgammonEvaluator
     board = make_test_board()
     state = make_test_state(
         current_player=jnp.int32(0),
@@ -922,9 +927,9 @@ def test_estimate_batch_equity():
     )
     obs = observe(state)
 
-    predictor = SimpleEquityPredictor(SimpleEquityPredictor.get_default_config())
-    # Test new observation format [B, 197]
-    equity_new = predictor.eval(obs[jnp.newaxis, :])
+    predictor = SimpleBackgammonEvaluator(SimpleBackgammonEvaluator.get_default_config())
+    batched_state = jax.tree_util.tree_map(lambda x: x[jnp.newaxis, ...], state)
+    equity_new = predictor.eval(batched_state)
     assert equity_new.shape == (1,)
     assert jnp.isfinite(equity_new[0])
 
@@ -968,8 +973,8 @@ def test_calc_made_points():
 
 
 def test_calc_blots_heuristic():
-    board1 = jnp.zeros(28, dtype=BOARD_DTYPE).at[1].set(1).at[2].set(1).at[3].set(-1).at[]
-    board2 = jnp.zeros(28, dtype=BOARD_DTYPE).at[4].set(-1).at[5].set(-1).at[6].set(-1)
+    board1 = jnp.zeros(28, dtype=BOARD_DTYPE).at[1].set(1).at[2].set(1).at[3].set(-1).at[15].set(-3).at[18].set(2)
+    board2 = jnp.zeros(28, dtype=BOARD_DTYPE).at[4].set(-1).at[5].set(-1).at[6].set(-1).at[15].set(-3).at[18].set(2)
 
     # 1. Call with a single board (shape 1, 28)
     my_blots, opp_blots = _calc_blots_heuristic(board1[jnp.newaxis, :])
@@ -1337,7 +1342,8 @@ def test_arr_apply_diff():
         if cur_test.is_hit:
             expected_board = expected_board.at[cur_test.tgt].set(1)
 
-        is_legal, is_legal_hit_tgt = _arr_apply_diff(cur_test.board, jnp.tile(cur_diff, (156, 1)), cur_test.src, cur_test.die, cur_test.tgt)
+        is_legal = _arr_apply_diff(cur_test.board, jnp.tile(cur_diff, (156, 1)), cur_test.src, cur_test.die, cur_test.tgt)
+        is_legal_hit_tgt = (jnp.tile(cur_diff, (156, 1)) > 0) & (cur_test.board == -1)
         new_board = jnp.where(is_legal_hit_tgt[action], BOARD_DTYPE(1), cur_test.board + cur_diff)
         assert is_legal[action] == cur_test.is_legal, cur_test.description
         assert (new_board == expected_board).all(), cur_test.description
@@ -1351,19 +1357,21 @@ def test_arr_one_and_two_moves():
            0,  0,  0,  0,  0,  0,    0,  0,  0,  2,  0, -2,    0,  0,   11, -8
     ], dtype=BOARD_DTYPE)
 
-    one_move_legal, two_move_legal = _arr_one_and_two_moves(orig_board)
+    one_move_legal, one_move_boards, two_move_legal = _arr_one_and_two_moves(orig_board)
 
     assert one_move_legal.shape == (156,)
+    assert one_move_boards.shape == (156, 28)
     assert two_move_legal.shape == (156, 156)
 
     # Let's manually verify a few combinations
-    expected_one_move_legal, expected_one_move_hit_tgt = _arr_apply_diff(orig_board, ONE_MOVE_BOARD_DIFFS, ONE_MOVE_SRC, ONE_MOVE_DIE, ONE_MOVE_TGT)
+    expected_one_move_legal = _arr_apply_diff(orig_board, ONE_MOVE_BOARD_DIFFS, ONE_MOVE_SRC, ONE_MOVE_DIE, ONE_MOVE_TGT)
+    expected_one_move_hit_tgt = (ONE_MOVE_BOARD_DIFFS > 0) & (orig_board == -1)
     expected_one_move_boards = jnp.where(expected_one_move_hit_tgt, BOARD_DTYPE(1), orig_board + ONE_MOVE_BOARD_DIFFS)
 
     test_actions = list(range((3 + 2) * 6 - 2, (3 + 2) * 6 + 2)) + [(5 + 2) * 6 + 4, (21 + 2) * 6 + 4]
     for i in test_actions:
         for j in test_actions:
-            expected_two_move_legal, _ = _arr_apply_diff(expected_one_move_boards[i], jnp.tile(ONE_MOVE_BOARD_DIFFS[j], (156, 1)), ONE_MOVE_SRC[j], ONE_MOVE_DIE[j], ONE_MOVE_TGT[j])
+            expected_two_move_legal = _arr_apply_diff(expected_one_move_boards[i], jnp.tile(ONE_MOVE_BOARD_DIFFS[j], (156, 1)), ONE_MOVE_SRC[j], ONE_MOVE_DIE[j], ONE_MOVE_TGT[j])
             assert two_move_legal[i, j] == expected_two_move_legal[j]
 
 
@@ -1567,6 +1575,78 @@ def test_forced_moves():
                     cur_board = _flip_board(cur_board)
                 assert (s._board == cur_board[None,:]).all()
                 answer_idx += 1
+
+
+def test_strategy_simple():
+    StrategyTest = namedtuple('StrategyTest', ['board', 'dice', 'src_pos', 'tgt_pos', 'description'])
+
+    # test whether SimpleBackgammonEvaluator is picking the obvious best move
+    start_board = jnp.array(START_POSITIONS, dtype=BOARD_DTYPE)
+    starting_moves = [
+        StrategyTest(start_board, (1, 3), (16, 18), (19, 19), '1 and 3 opening roll'),
+        StrategyTest(start_board, (2, 4), (16, 18), (20, 20), '2 and 4 opening roll'),
+        StrategyTest(start_board, (6, 1), (11, 16), (17, 17), '1 and 6 opening roll'),
+    ]
+
+    hit_make_point_board = jnp.array([
+        #  0,  1,  2,  3,  4,  5,    6,  7,  8,  9, 10, 11,
+           1,  0,  1,  0,  0, -3,    0, -4,  0,  0,  0,  2,
+        # 12, 13, 14, 15, 16, 17,   18, 19, 20, 21, 22, 23,   24, 25,   26,  27
+          -5,  1,  0,  0,  0,  3,    3,  2,  2,  0,  0, -2,    0,  0,    0,   0   # we will add blot on 21 or 22
+    ], dtype=BOARD_DTYPE)
+    hit_and_make_home_point = [
+        StrategyTest(hit_make_point_board.at[21].set(-1), (4, 3), (17, 18), (21, 21), 'able to hit and make point on idx 21'),
+        StrategyTest(hit_make_point_board.at[22].set(-1), (5, 4), (17, 18), (22, 22), 'able to hit and make point on idx 22'),
+    ]
+
+    all_tests = starting_moves + hit_and_make_home_point
+    all_boards = jnp.concatenate([test.board for test in all_tests])
+
+    for cur_test in all_tests:
+        assert (jnp.sum(jnp.clip(cur_test.board, 0, None)) == 15).all()
+        assert (jnp.sum(jnp.clip(cur_test.board, None, 0)) == -15).all()
+
+        all_actions = [(src + 2) * 6 + (tgt - src) - 1 for src, tgt in zip(cur_test.src_pos, cur_test.tgt_pos)]
+
+        dice = jnp.array(cur_test.dice, dtype=jnp.int32) - 1   # dice are encoded as 0 through 5
+        playable_dice = _set_playable_dice(dice)
+
+        rng = jax.random.PRNGKey(0)
+
+        start_state = make_test_state(
+            current_player=jnp.int32(0),
+            board=cur_test.board,
+            turn=jnp.int32(0),
+            dice=dice,
+            playable_dice=playable_dice,
+            played_dice_num=jnp.int32(0),
+            legal_action_mask=_arr_legal_action_mask(cur_test.board, playable_dice)
+        )
+        expected_state = start_state
+        for action in all_actions:
+            assert expected_state.legal_action_mask[action], cur_test.description
+            expected_state = step(expected_state, action, rng)
+
+        batch_size = 10
+        rng = jax.random.PRNGKey(0)
+        config = SimpleBackgammonEvaluator.get_default_config()
+        config_batched = jax.tree_util.tree_map(lambda x: jnp.stack([x] * batch_size), config)
+        strategy = BackgammonTwoPlyStrategy(env)
+
+        # have the strategy play it's best moves, the moves may be in a different order
+        # but should end up with the same final board
+        strategy_state = jax.tree_util.tree_map(lambda x: jnp.stack([x] * batch_size), start_state)
+        for _ in range(len(all_actions)):
+            rng, subkey = jax.random.split(rng)
+            keys = jax.random.split(subkey, batch_size)
+            actions = strategy.get_next_action(strategy_state, keys, config_batched, SimpleBackgammonEvaluator)
+            strategy_state = jax.vmap(step)(strategy_state, actions, keys)
+
+        vmap_flip_board = jax.vmap(_flip_board)
+        assert (strategy_state._playable_dice == -1).all(), cur_test.description
+        assert (strategy_state.current_player == 1).all(), cur_test.description
+        assert (strategy_state._board == expected_state._board).all(), cur_test.description   # note the boards will both be flipped
+
 
 
 def test_calc_win_score():

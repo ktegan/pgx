@@ -14,6 +14,7 @@
 
 import warnings
 import abc
+import dataclasses
 from typing import Literal, Optional, Tuple, get_args
 
 import jax
@@ -133,6 +134,9 @@ class State(abc.ABC):
 
     def get_normal_or_chance_logits_recalc(self, logits:Array) -> Array:
         return self.get_normal_or_chance_logits(logits, self.get_chance_logits())
+
+    def observation_chance_elements(self) -> int:
+        return 0
 
     @property
     @abc.abstractmethod
@@ -452,3 +456,53 @@ def make(env_id: EnvId):  # noqa: C901
     else:
         envs = "\n".join(available_envs())
         raise ValueError(f"Wrong env_id '{env_id}' is passed. Available ids are: \n{envs}")
+
+
+class Strategy(abc.ABC):
+    @abc.abstractmethod
+    def get_next_action(self, state: State, rng_key: Array, config, model_cls) -> Array:
+        pass
+
+
+@jax.jit(static_argnames=('repeat_factor',))
+def broadcast_config(config, repeat_factor: int):
+    new_fields = {}
+    for field in dataclasses.fields(config):
+        val = getattr(config, field.name)
+        repeated = jnp.repeat(val[:, jnp.newaxis, ...], repeat_factor, axis=1)
+        new_fields[field.name] = repeated.reshape((-1,) + val.shape[1:])
+    return type(config)(**new_fields)
+
+
+class OnePlyStrategy(Strategy):
+    def __init__(self, env):
+        self.env = env
+
+    def get_next_action(self, state: State, rng_key: Array, config, model_cls) -> Array:
+        num_chance = state.observation_chance_elements()
+        num_move_actions = self.env.num_actions - num_chance
+        broad_config = broadcast_config(config, num_move_actions)
+        model = model_cls(broad_config)
+
+        actions_all = jnp.arange(num_move_actions)
+        batch_size = state.current_player.shape[0]
+        lookahead_rng, _ = jax.random.split(rng_key, 2)
+        lookahead_keys = jax.random.split(lookahead_rng, batch_size)
+
+        # 1-ply lookahead using env.step
+        next_states = jax.vmap(jax.vmap(self.env.step, in_axes=(None, 0, None)), in_axes=(0, None, 0))(state, actions_all, lookahead_keys)
+        parent_player = state.current_player
+        obs = jax.vmap(jax.vmap(self.env.observe, in_axes=(0, None)), in_axes=(0, 0))(next_states, parent_player)
+
+        obs_size = self.env.observation_shape[-1]
+        equities_flat = model.eval(obs.reshape((-1, obs_size)))
+        equities = equities_flat.reshape((batch_size, num_move_actions))
+
+        masked_equities = jnp.where(state.legal_action_mask[:, :num_move_actions], equities, jnp.finfo(equities.dtype).min)
+        return jnp.argmax(masked_equities, axis=-1)
+
+
+class Evaluator(abc.ABC):
+    @abc.abstractmethod
+    def eval(self, state: State) -> Array:
+        pass
