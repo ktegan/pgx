@@ -6,6 +6,7 @@ import jax
 import jax.numpy as jnp
 
 from pgx._src.utils import _download
+from pgx.models.aznet import AZNet
 
 BaselineModelId = Literal[
     "animal_shogi_v0",
@@ -150,92 +151,8 @@ def _create_az_model_v0(
     num_actions,
     num_channels: int = 128,
     num_layers: int = 6,
+    decay_rate: float = 0.9,
+    kernel_shape: int = 3,
     resnet_v2: bool = True,
 ):
-    # We referred to Haiku's ResNet implementation:
-    # https://github.com/deepmind/dm-haiku/blob/main/haiku/_src/nets/resnet.py
-    import haiku as hk
-
-    class BlockV1(hk.Module):
-        def __init__(self, num_channels, name="BlockV1"):
-            super(BlockV1, self).__init__(name=name)
-            self.num_channels = num_channels
-
-        def __call__(self, x, is_training, test_local_stats):
-            i = x
-            x = hk.Conv2D(self.num_channels, kernel_shape=3)(x)
-            x = hk.BatchNorm(True, True, 0.9)(x, is_training, test_local_stats)
-            x = jax.nn.relu(x)
-            x = hk.Conv2D(self.num_channels, kernel_shape=3)(x)
-            x = hk.BatchNorm(True, True, 0.9)(x, is_training, test_local_stats)
-            return jax.nn.relu(x + i)
-
-    class BlockV2(hk.Module):
-        def __init__(self, num_channels, name="BlockV2"):
-            super(BlockV2, self).__init__(name=name)
-            self.num_channels = num_channels
-
-        def __call__(self, x, is_training, test_local_stats):
-            i = x
-            x = hk.BatchNorm(True, True, 0.9)(x, is_training, test_local_stats)
-            x = jax.nn.relu(x)
-            x = hk.Conv2D(self.num_channels, kernel_shape=3)(x)
-            x = hk.BatchNorm(True, True, 0.9)(x, is_training, test_local_stats)
-            x = jax.nn.relu(x)
-            x = hk.Conv2D(self.num_channels, kernel_shape=3)(x)
-            return x + i
-
-    class AZNet(hk.Module):
-        """AlphaZero NN architecture."""
-
-        def __init__(
-            self,
-            num_actions,
-            num_channels: int,
-            num_layers: int,
-            resnet_v2: bool,
-            name="az_net",
-        ):
-            super().__init__(name=name)
-            self.num_actions = num_actions
-            self.num_channels = num_channels
-            self.num_layers = num_layers
-            self.resnet_v2 = resnet_v2
-            self.resnet_cls = BlockV2 if resnet_v2 else BlockV1
-
-        def __call__(self, x, is_training, test_local_stats):
-            x = x.astype(jnp.float32)
-            x = hk.Conv2D(self.num_channels, kernel_shape=3)(x)
-
-            if not self.resnet_v2:
-                x = hk.BatchNorm(True, True, 0.9)(x, is_training, test_local_stats)
-                x = jax.nn.relu(x)
-
-            for i in range(self.num_layers):
-                x = self.resnet_cls(self.num_channels, name=f"block_{i}")(x, is_training, test_local_stats)
-
-            if self.resnet_v2:
-                x = hk.BatchNorm(True, True, 0.9)(x, is_training, test_local_stats)
-                x = jax.nn.relu(x)
-
-            # policy head
-            logits = hk.Conv2D(output_channels=2, kernel_shape=1)(x)
-            logits = hk.BatchNorm(True, True, 0.9)(logits, is_training, test_local_stats)
-            logits = jax.nn.relu(logits)
-            logits = hk.Flatten()(logits)
-            logits = hk.Linear(self.num_actions)(logits)
-
-            # value head
-            value = hk.Conv2D(output_channels=1, kernel_shape=1)(x)
-            value = hk.BatchNorm(True, True, 0.9)(value, is_training, test_local_stats)
-            value = jax.nn.relu(value)
-            value = hk.Flatten()(value)
-            value = hk.Linear(self.num_channels)(value)
-            value = jax.nn.relu(value)
-            value = hk.Linear(1)(value)
-            value = jnp.tanh(value)
-            value = value.reshape((-1,))
-
-            return logits, value
-
-    return AZNet(num_actions, num_channels, num_layers, resnet_v2)
+    return AZNet(num_actions, num_channels, num_layers, decay_rate, kernel_shape, resnet_v2)
