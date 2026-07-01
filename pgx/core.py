@@ -460,7 +460,7 @@ def make(env_id: EnvId):  # noqa: C901
 
 class Strategy(abc.ABC):
     @abc.abstractmethod
-    def get_next_action(self, state: State, rng_key: Array, config, model_cls) -> Array:
+    def get_next_action_batch(self, state: State, rng_key: Array, config, model_cls) -> Array:
         pass
 
 
@@ -478,7 +478,7 @@ class OnePlyStrategy(Strategy):
     def __init__(self, env):
         self.env = env
 
-    def get_next_action(self, state: State, rng_key: Array, config, model_cls) -> Array:
+    def get_next_action_batch(self, state: State, rng_key: Array, config, model_cls) -> Array:
         num_chance = state.observation_chance_elements()
         num_move_actions = self.env.num_actions - num_chance
         broad_config = broadcast_config(config, num_move_actions)

@@ -12,6 +12,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+from pgx.backgammon import BackgammonFullTurnStrategy
 import dataclasses
 
 from pgx.backgammon import BackgammonTwoPlyStrategy
@@ -29,28 +30,29 @@ def main_manual():
         num_generations=1,
         num_candidates=6,
         num_champions=2,
-        batch_size=2000,
+        batch_size=1000,
         abs_stddev=0.0,
         rel_stddev=0.03,
         mutate_field_prob=0.3,
         p_threshold=0.1,
-        max_games_per_generation=40000,
-        min_games_per_generation=80000,
+        max_games_per_generation=1000,
+        min_games_per_generation=1000,
         stddev_shrink=0.8,
         mutate_parameters=None,
         freeze_parameters=('prime_reward',),
     )
 
-    mult_range = [0.7, 0.85, 1.0, 1.0/0.85, 1.0/0.7]
+    mult_range = [0.9, 0.95, 1.0, 1.0/0.95, 1.0/0.9]
     config_dict = dataclasses.asdict(SimpleBackgammonEvaluatorConfig())
-    for field in config_dict.keys():
+    for field in ['made_points_weight']:
         config_lst = []
         for mult in mult_range:
             cur_config = config_dict.copy()
             cur_config[field] = config_dict[field] * mult
             config_lst.append(SimpleBackgammonEvaluatorConfig(**cur_config))
 
-        strategy_factory = lambda env: BackgammonTwoPlyStrategy(env)
+        #strategy_factory = lambda env: BackgammonTwoPlyStrategy(env)
+        strategy_factory = lambda env: BackgammonFullTurnStrategy(env)
 
         print(f'STARTING FOR {field=}')
         run_tournament('backgammon', SimpleBackgammonEvaluator, config, strategy_factory=strategy_factory, candidate_config_lst=config_lst)
@@ -65,5 +67,5 @@ def main_optuna():
     optuna_param_search('backgammon', SimpleBackgammonEvaluator, search_config, strategy_factory=strategy_factory, initial_params=initial_params)
 
 if __name__ == "__main__":
-    # main_manual()
-    main_optuna()
+    main_manual()
+    # main_optuna()

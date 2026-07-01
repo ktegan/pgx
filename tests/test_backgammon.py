@@ -1,10 +1,10 @@
-from pgx.backgammon import BackgammonTwoPlyStrategy
 from collections import namedtuple
 from dataclasses import dataclass
 
 import jax
 import jax.numpy as jnp
 
+import pgx.core
 from pgx.experimental.utils import act_randomly
 from pgx._src.types import Array
 
@@ -19,6 +19,7 @@ from pgx.backgammon import (
     Backgammon,
     SimpleBackgammonEvaluator,
     BackgammonTwoPlyStrategy,
+    BackgammonFullTurnStrategy,
     _decompose_action,
     _to_playable_dice_count,
     _flip_board,
@@ -28,7 +29,7 @@ from pgx.backgammon import (
     _change_turn,
     _is_action_legal,
     _is_all_on_home_board,
-    _arr_apply_diff,
+    _arr_is_move_legal,
     _arr_one_and_two_moves,
     _is_open,
     _move,
@@ -44,7 +45,7 @@ from pgx.backgammon import (
     _arr_is_illegal_on_board,
     _arr_is_illegal_off,
     _make_observation,
-    _observation_to_board_and_dice,
+    _observation_to_board,
     _calc_pip_diff,
     _calc_made_points,
     _calc_blots_heuristic,
@@ -69,7 +70,7 @@ _calc_win_score = jax.jit(_calc_win_score)
 _change_turn = jax.jit(_change_turn)
 _is_action_legal = jax.jit(_is_action_legal)
 _is_all_on_home_board = jax.jit(_is_all_on_home_board)
-_arr_apply_diff = jax.jit(_arr_apply_diff)
+_arr_is_move_legal = jax.jit(_arr_is_move_legal)
 _arr_one_and_two_moves = jax.jit(_arr_one_and_two_moves)
 _is_open = jax.jit(_is_open)
 _move = jax.jit(_move)
@@ -159,6 +160,42 @@ def make_answer_use_2_moves_simple():
           # 12, 13, 14, 15, 16, 17,   18, 19, 20, 21, 22, 23,   24, 25,   26,  27,    28
              0,  0,  0,  0,  0, -2,    0,  0,  2,  1, -2,  0,    0,  0,   11,  -7,     2],
     ], dtype=BOARD_DTYPE))
+
+
+def make_test_board_no_legal_moves():
+    """
+    Test that we do both legal moves.  If we roll a 2 and a 4
+    then the black checker at index 15 must move to index 19
+    then to index 21.
+    """
+    return jnp.array([
+        #  0,  1,  2,  3,  4,  5,    6,  7,  8,  9, 10, 11,
+           0,  0,  0,  0,  0,  0,    1,  0, -2,  0, -2,  0,
+        # 12, 13, 14, 15, 16, 17,   18, 19, 20, 21, 22, 23,   24, 25,   26,  27
+           0,  0,  0,  1,  0, -2,    0, -2,  2,  0, -2,  0,    0,  0,   11,  -5
+    ], dtype=BOARD_DTYPE)
+
+"""
+黒: + 白: -
+12 13 14 15 16 17  18 19 20 21 22 23
+          +     -      -  +     -
+                -      -  +     -
+
+
+    -     -
+    -     -     +
+11 10  9  8  7  6   5  4  3  2  1  0
+Bar
+Off +++++++++++   ---------
+"""
+
+def make_answer_no_legal_moves():
+    """
+    Give the expected board state where the target number of moves is the,
+    final element.  We assume that if an answer goes up to move X it means
+    that only X moves are possible this turn.
+    """
+    return ([2, 4], jnp.zeros((0, 28 + 1), dtype=BOARD_DTYPE))
 
 
 def make_test_board_use_4_moves_simple():
@@ -394,7 +431,7 @@ def make_test_board_use_4_moves_bear_off_v1():
 """
 黒: + 白: -
 12 13 14 15 16 17  18 19 20 21 22 23
-               -1         +        -
+                -         +        -
                           +        -
 
 
@@ -875,28 +912,19 @@ def test_observe():
         playable_dice=jnp.array([2, 2, 2, -1], dtype=jnp.int32),
         played_dice_num=jnp.int32(1),
     )
-    playable_dice_count = jnp.array([0, 0, 3, 0, 0, 0], dtype=jnp.int32)
 
-    current_player = 0
-    for player_id in range(2):
-        at_least_one_playable = (playable_dice_count >= 1).astype(jnp.float32)
-        extra_playable = jnp.clip(playable_dice_count - 1, 0, None) / 3.0
-        expected_obs = jnp.concatenate([
-            exp_pts_1, exp_pts_2, exp_pts_ge3, exp_pts_excess,
-            exp_pts_neg1, exp_pts_neg2, exp_pts_le_neg3, exp_pts_neg_excess,
-            exp_bar, exp_off, at_least_one_playable, extra_playable, jnp.array([1.0 if player_id == current_player else 0.0], dtype=jnp.float32)
-        ], axis=None)
+    expected_obs = jnp.concatenate([
+        exp_pts_1, exp_pts_2, exp_pts_ge3, exp_pts_excess,
+        exp_pts_neg1, exp_pts_neg2, exp_pts_le_neg3, exp_pts_neg_excess,
+        exp_bar, exp_off
+    ], axis=None)
 
-        obs = _make_observation(board, playable_dice_count=playable_dice_count, current_player=current_player, player_id=player_id)
-        assert jnp.allclose(obs, expected_obs)
+    obs = _make_observation(board)
+    assert jnp.allclose(obs, expected_obs)
 
-        reconstructed_board, reconstructed_dice = _observation_to_board_and_dice(obs)
-        if current_player == player_id:
-            assert (reconstructed_board == board).all()
-            assert jnp.allclose(reconstructed_dice, playable_dice_count)
-            assert jnp.allclose(observe(state), obs)
-        else:
-            assert (reconstructed_board == _flip_board(board)).all()
+    reconstructed_board = _observation_to_board(obs)
+    assert (reconstructed_board == board).all()
+    assert jnp.allclose(observe(state), obs)
 
 
 def test_to_playable_dice_count():
@@ -1284,7 +1312,7 @@ def test_arr_is_illegal_off():
     assert (~_arr_is_illegal_off(mask5, jnp.int32(20), jnp.int32(26), jnp.int32(5))).all()
 
 
-def test_arr_apply_diff():
+def test_arr_is_move_legal():
 
     @dataclass(frozen=True)
     class CaseApplyDiff:
@@ -1342,7 +1370,7 @@ def test_arr_apply_diff():
         if cur_test.is_hit:
             expected_board = expected_board.at[cur_test.tgt].set(1)
 
-        is_legal = _arr_apply_diff(cur_test.board, jnp.tile(cur_diff, (156, 1)), cur_test.src, cur_test.die, cur_test.tgt)
+        is_legal = _arr_is_move_legal(cur_test.board, jnp.tile(cur_diff, (156, 1)), cur_test.src, cur_test.die, cur_test.tgt)
         is_legal_hit_tgt = (jnp.tile(cur_diff, (156, 1)) > 0) & (cur_test.board == -1)
         new_board = jnp.where(is_legal_hit_tgt[action], BOARD_DTYPE(1), cur_test.board + cur_diff)
         assert is_legal[action] == cur_test.is_legal, cur_test.description
@@ -1357,22 +1385,47 @@ def test_arr_one_and_two_moves():
            0,  0,  0,  0,  0,  0,    0,  0,  0,  2,  0, -2,    0,  0,   11, -8
     ], dtype=BOARD_DTYPE)
 
-    one_move_legal, one_move_boards, two_move_legal = _arr_one_and_two_moves(orig_board)
+    for dice_pair in [[1, 2], [3, 5], [4, 6], [1, 1], [6, 6]]:
+        dice = jnp.array(dice_pair, dtype=jnp.int32)
+        one_move_legal, one_move_boards, two_move_legal, candidate_action_indices, candidate_tgt, candidate_diffs = \
+            _arr_one_and_two_moves(orig_board, dice)
 
-    assert one_move_legal.shape == (156,)
-    assert one_move_boards.shape == (156, 28)
-    assert two_move_legal.shape == (156, 156)
+        assert one_move_legal.shape == (52,)
+        assert one_move_boards.shape == (52, 28)
+        assert two_move_legal.shape == (52, 52)
+        assert candidate_action_indices.shape == (52,)
+        assert candidate_tgt.shape == (52,)
+        assert candidate_diffs.shape == (52, 28)
 
-    # Let's manually verify a few combinations
-    expected_one_move_legal = _arr_apply_diff(orig_board, ONE_MOVE_BOARD_DIFFS, ONE_MOVE_SRC, ONE_MOVE_DIE, ONE_MOVE_TGT)
-    expected_one_move_hit_tgt = (ONE_MOVE_BOARD_DIFFS > 0) & (orig_board == -1)
-    expected_one_move_boards = jnp.where(expected_one_move_hit_tgt, BOARD_DTYPE(1), orig_board + ONE_MOVE_BOARD_DIFFS)
+        # Verify Move 1 legality and boards
+        for i in range(52):
+            action = candidate_action_indices[i]
+            expected_legal = _arr_is_move_legal(orig_board, candidate_diffs[i], ONE_MOVE_SRC[action], ONE_MOVE_DIE[action], ONE_MOVE_TGT[action])
+            assert one_move_legal[i] == expected_legal[action]
 
-    test_actions = list(range((3 + 2) * 6 - 2, (3 + 2) * 6 + 2)) + [(5 + 2) * 6 + 4, (21 + 2) * 6 + 4]
-    for i in test_actions:
-        for j in test_actions:
-            expected_two_move_legal = _arr_apply_diff(expected_one_move_boards[i], jnp.tile(ONE_MOVE_BOARD_DIFFS[j], (156, 1)), ONE_MOVE_SRC[j], ONE_MOVE_DIE[j], ONE_MOVE_TGT[j])
-            assert two_move_legal[i, j] == expected_two_move_legal[j]
+            expected_hit_tgt = (candidate_diffs[i] > 0) & (orig_board == -1)
+            expected_board = jnp.where(expected_hit_tgt, BOARD_DTYPE(1), orig_board + candidate_diffs[i])
+            expected_hit_count = expected_hit_tgt.sum().astype(BOARD_DTYPE)
+            expected_board = expected_board.at[25].add(-expected_hit_count)
+
+            assert (one_move_boards[i] == expected_board).all()
+
+        # Verify Move 2 legality
+        for i in range(52):
+            for j in range(52):
+                if (i < 26 and j >= 26) or (i >= 26 and j < 26):
+                    action_j = candidate_action_indices[j]
+                    expected_legal_j = _arr_is_move_legal(
+                        one_move_boards[i],
+                        candidate_diffs[j],
+                        ONE_MOVE_SRC[action_j],
+                        ONE_MOVE_DIE[action_j],
+                        ONE_MOVE_TGT[action_j]
+                    )
+                    expected_two_move_legal = expected_legal_j[action_j]
+                    assert two_move_legal[i, j] == expected_two_move_legal
+                else:
+                    assert two_move_legal[i, j] == False
 
 
 def test_arr_legal_action():
@@ -1457,9 +1510,10 @@ def test_arr_legal_action():
     assert (expected_legal_action_mask == legal_action_mask).all()
 
 
-def test_forced_moves():
-    board_answer_pairs = [
+def get_board_answer_pairs():
+    return [
         (make_test_board_use_2_moves_simple(),                 make_answer_use_2_moves_simple()),
+        (make_test_board_no_legal_moves(),                     make_answer_no_legal_moves()),
         (make_test_board_use_4_moves_simple(),                 make_answer_use_4_moves_simple()),
         (make_test_board_use_2_moves_order_matters(),          make_answer_use_2_moves_order_matters()),
         (make_test_board_use_1_move_higher_roll(),             make_answer_use_1_move_higher_roll()),
@@ -1473,10 +1527,14 @@ def test_forced_moves():
         (make_test_board_use_2_moves_bear_off_order_matters(), make_answer_use_2_moves_bear_off_order_matters()),
     ]
 
+
+def test_forced_moves():
+    board_answer_pairs = get_board_answer_pairs()
+
     for _test_num, (test_board, (dice, answer)) in enumerate(board_answer_pairs):
         expected_boards = answer[:,:28]
         move_nums = answer[:,28]
-        max_move = jnp.max(move_nums)
+        max_move = 0 if len(move_nums) == 0 else jnp.max(move_nums)
 
         rolled_doubles = dice[0] == dice[1]
         theoretical_max_move = 4 if rolled_doubles else 2
@@ -1568,7 +1626,7 @@ def test_forced_moves():
                 assert (~vmap_has_chance_logits_recalc(s)).all()     # player move action is next, we are not using chance logits
                 assert (s._playable_dice != -1).any(axis=-1).all()   # existing or new now has playable dice
 
-            if move_nums[answer_idx] == move_num:
+            if len(move_nums) > 0 and move_nums[answer_idx] == move_num:
                 # validate that the current board matches all game boards
                 cur_board = expected_boards[answer_idx]
                 if move_num >= max_move + steps_after_max_move - 1:
@@ -1577,12 +1635,63 @@ def test_forced_moves():
                 answer_idx += 1
 
 
-def test_strategy_simple():
-    StrategyTest = namedtuple('StrategyTest', ['board', 'dice', 'src_pos', 'tgt_pos', 'description'])
+StrategyTest = namedtuple('StrategyTest', ['board', 'dice', 'src_pos', 'tgt_pos', 'description'])
+
+
+def _run_strategy_test(strategy, cur_test, eval_cls=SimpleBackgammonEvaluator):
+    assert_msg = ', '.join([cur_test.description, str(strategy.__class__)])
+    assert (jnp.sum(jnp.clip(cur_test.board, 0, None)) == 15).all()
+    assert (jnp.sum(jnp.clip(cur_test.board, None, 0)) == -15).all()
+
+    all_actions = [(src + 2) * 6 + (tgt - src) - 1 for src, tgt in zip(cur_test.src_pos, cur_test.tgt_pos)]
+
+    dice = jnp.array(cur_test.dice, dtype=jnp.int32) - 1   # dice are encoded as 0 through 5
+    playable_dice = _set_playable_dice(dice)
+
+    rng = jax.random.PRNGKey(0)
+
+    start_state = make_test_state(
+        current_player=jnp.int32(0),
+        board=cur_test.board,
+        turn=jnp.int32(0),
+        dice=dice,
+        playable_dice=playable_dice,
+        played_dice_num=jnp.int32(0),
+        legal_action_mask=_arr_legal_action_mask(cur_test.board, playable_dice)
+    )
+    expected_state = start_state
+    for action in all_actions:
+        assert expected_state.legal_action_mask[action], assert_msg
+        expected_state = step(expected_state, action, rng)
+
+    batch_size = 10
+    rng = jax.random.PRNGKey(0)
+    config = eval_cls.get_default_config()
+    config_batched = jax.tree_util.tree_map(lambda x: jnp.stack([x] * batch_size), config)
+
+    # have the strategy play it's best moves, the moves may be in a different order
+    # but should end up with the same final board
+    strategy_state = jax.tree_util.tree_map(lambda x: jnp.stack([x] * batch_size), start_state)
+    for idx in range(len(all_actions)):
+        rng, subkey = jax.random.split(rng)
+        keys = jax.random.split(subkey, batch_size)
+        actions = strategy.get_next_action_batch(strategy_state, keys, config_batched, eval_cls)
+        assert strategy_state.legal_action_mask[jnp.arange(batch_size), actions].all(), assert_msg
+        strategy_state = jax.vmap(step)(strategy_state, actions, keys)
+
+    vmap_flip_board = jax.vmap(_flip_board)
+
+    assert (strategy_state._playable_dice == -1).all(), assert_msg
+    assert (strategy_state.current_player == 1).all(), assert_msg
+    # flip the board back to being the first player's turn
+    assert (vmap_flip_board(strategy_state._board) == _flip_board(expected_state._board)).all(), assert_msg
+
+
+def test_strategy_obvious_moves():
 
     # test whether SimpleBackgammonEvaluator is picking the obvious best move
     start_board = jnp.array(START_POSITIONS, dtype=BOARD_DTYPE)
-    starting_moves = [
+    starting_move_tests = [
         StrategyTest(start_board, (1, 3), (16, 18), (19, 19), '1 and 3 opening roll'),
         StrategyTest(start_board, (2, 4), (16, 18), (20, 20), '2 and 4 opening roll'),
         StrategyTest(start_board, (6, 1), (11, 16), (17, 17), '1 and 6 opening roll'),
@@ -1594,59 +1703,63 @@ def test_strategy_simple():
         # 12, 13, 14, 15, 16, 17,   18, 19, 20, 21, 22, 23,   24, 25,   26,  27
           -5,  1,  0,  0,  0,  3,    3,  2,  2,  0,  0, -2,    0,  0,    0,   0   # we will add blot on 21 or 22
     ], dtype=BOARD_DTYPE)
-    hit_and_make_home_point = [
+    hit_and_make_home_point_tests = [
         StrategyTest(hit_make_point_board.at[21].set(-1), (4, 3), (17, 18), (21, 21), 'able to hit and make point on idx 21'),
         StrategyTest(hit_make_point_board.at[22].set(-1), (5, 4), (17, 18), (22, 22), 'able to hit and make point on idx 22'),
     ]
 
-    all_tests = starting_moves + hit_and_make_home_point
+    # a NOOP move is encoded as src=-2, tgt=-1
+    one_move_board = make_test_board_use_1_move_higher_roll()
+    one_move_tests = [
+        StrategyTest(one_move_board, (4, 6), (0, -2), (6, -1), 'only one legal move then NOOP'),
+    ]
+
+    no_move_board = make_test_board_no_legal_moves()
+    no_move_tests = [
+        StrategyTest(no_move_board, (2, 4), (-2,), (-1,), 'no legal moves, only NOOP'),
+    ]
+
+    all_tests = starting_move_tests + hit_and_make_home_point_tests + one_move_tests + no_move_tests
     all_boards = jnp.concatenate([test.board for test in all_tests])
 
-    for cur_test in all_tests:
-        assert (jnp.sum(jnp.clip(cur_test.board, 0, None)) == 15).all()
-        assert (jnp.sum(jnp.clip(cur_test.board, None, 0)) == -15).all()
+    strategy_lst = [BackgammonTwoPlyStrategy(env), BackgammonFullTurnStrategy(env)]
+    for strategy in strategy_lst:
+        for cur_test in all_tests:
+            _run_strategy_test(strategy, cur_test)
 
-        all_actions = [(src + 2) * 6 + (tgt - src) - 1 for src, tgt in zip(cur_test.src_pos, cur_test.tgt_pos)]
 
-        dice = jnp.array(cur_test.dice, dtype=jnp.int32) - 1   # dice are encoded as 0 through 5
-        playable_dice = _set_playable_dice(dice)
+def test_strategy_full_move():
+    class UnitTestEvaluator(pgx.core.Evaluator):
+        @classmethod
+        def get_default_config(cls):
+            return SimpleBackgammonEvaluator.get_default_config()
 
-        rng = jax.random.PRNGKey(0)
+        def __init__(self, config):
+            pass
 
-        start_state = make_test_state(
-            current_player=jnp.int32(0),
-            board=cur_test.board,
-            turn=jnp.int32(0),
-            dice=dice,
-            playable_dice=playable_dice,
-            played_dice_num=jnp.int32(0),
-            legal_action_mask=_arr_legal_action_mask(cur_test.board, playable_dice)
-        )
-        expected_state = start_state
-        for action in all_actions:
-            assert expected_state.legal_action_mask[action], cur_test.description
-            expected_state = step(expected_state, action, rng)
+        def eval(self, state: State) -> Array:
+            # create a reward that would require looking 4 moves ahead to discover,
+            # if you only look two moves ahead you would move one checker from 7 to 9,
+            # then you would move 13 to 15
+            board = state._board
+            specific_reward  = jnp.where(board[..., 8] == 4, 1e4, 0.0).astype(jnp.float32)
+            height_penalty   = -jnp.sum(jnp.clip(board[..., :24] - 1.0, 0, None) ** 2, axis=-1).astype(jnp.float32)
+            position_penalty = -jnp.sum(jnp.clip(board[..., :24] * jnp.arange(24, dtype=jnp.float32)[jnp.newaxis, :] * 1e-4, 0, None), axis=-1)
+            return specific_reward + position_penalty + height_penalty
 
-        batch_size = 10
-        rng = jax.random.PRNGKey(0)
-        config = SimpleBackgammonEvaluator.get_default_config()
-        config_batched = jax.tree_util.tree_map(lambda x: jnp.stack([x] * batch_size), config)
-        strategy = BackgammonTwoPlyStrategy(env)
+    all_blots = jnp.array([
+        #  0,  1,  2,  3,  4,  5,    6,  7,  8,  9, 10, 11,
+           1,  1,  1,  1,  1,  1,    1,  2,  1,  0,  1,  1,
+        # 12, 13, 14, 15, 16, 17,   18, 19, 20, 21, 22, 23,   24, 25,   26,  27
+           1,  1,  1,  0,  0,  0,    0,  0,  0,  0, -8, -7,    0,  0,    0,   0
+    ], dtype=BOARD_DTYPE)
 
-        # have the strategy play it's best moves, the moves may be in a different order
-        # but should end up with the same final board
-        strategy_state = jax.tree_util.tree_map(lambda x: jnp.stack([x] * batch_size), start_state)
-        for _ in range(len(all_actions)):
-            rng, subkey = jax.random.split(rng)
-            keys = jax.random.split(subkey, batch_size)
-            actions = strategy.get_next_action(strategy_state, keys, config_batched, SimpleBackgammonEvaluator)
-            strategy_state = jax.vmap(step)(strategy_state, actions, keys)
-
-        vmap_flip_board = jax.vmap(_flip_board)
-        assert (strategy_state._playable_dice == -1).all(), cur_test.description
-        assert (strategy_state.current_player == 1).all(), cur_test.description
-        assert (strategy_state._board == expected_state._board).all(), cur_test.description   # note the boards will both be flipped
-
+    two_ply_tests   = [StrategyTest(all_blots, (1, 1), (7, 8, 13, 14), (8, 9, 14, 15), 'short sighted eval will move from 7 to 9 then 13 to 15')]
+    full_move_tests = [StrategyTest(all_blots, (1, 1), (6, 7, 7, 7),   (7, 8, 8, 8),   'correctly move 3 checkers to put 4 checkers on position 8')]
+    strategy_lst    = [(BackgammonTwoPlyStrategy(env), two_ply_tests), (BackgammonFullTurnStrategy(env), full_move_tests)]
+    for strategy, all_tests in strategy_lst:
+        for cur_test in all_tests:
+            _run_strategy_test(strategy, cur_test, UnitTestEvaluator)
 
 
 def test_calc_win_score():

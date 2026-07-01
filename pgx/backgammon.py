@@ -13,7 +13,7 @@
 # limitations under the License.
 
 from functools import partial
-from typing import Optional
+from typing import Optional, Tuple
 
 import jax
 import jax.numpy as jnp
@@ -46,9 +46,28 @@ NO_MOVE_SUM        = MAX_MOVES * NO_MOVE
 IN_GAME_POSITIONS  = BOARD_LENGTH + BAR_POSITIONS
 ALL_GAME_POSITIONS = IN_GAME_POSITIONS + OFF_POSITIONS
 
+# Hashing weight vectors for collision-free board deduplication (pseudorandom 32-bit odd integers)
+HASH_WEIGHTS_1 = jnp.array([
+    1099087573, 2147483647, 391583921, 1438902821, 827391823,
+    918273911, 283719283, 192837123, 723192831, 381928371,
+    938102931, 481920391, 102938109, 392810293, 839201923,
+    192830192, 482910293, 928301923, 283910293, 102938192,
+    382910293, 839201928, 482910291, 928301922, 192830191,
+    392810291, 839201921, 283910291
+], dtype=jnp.int32)
+
+HASH_WEIGHTS_2 = jnp.array([
+    1827391823, 93810293, 839201923, 192830192, 482910293,
+    928301923, 283910293, 102938192, 382910293, 839201928,
+    482910291, 928301922, 192830191, 392810291, 839201921,
+    283910291, 1099087573, 2147483647, 391583921, 1438902821,
+    827391823, 918273911, 283719283, 192837123, 723192831,
+    381928371, 938102931, 481920391
+], dtype=jnp.int32)
+
 BOARD_ENCODE_ELEM  = 8                  # number of observation elements per board point
 DICE_ENCODE_ELEM   = 2                  # number of observation elements per die side
-OBSERVATION_SIZE   = BOARD_LENGTH * BOARD_ENCODE_ELEM + BAR_POSITIONS + OFF_POSITIONS + DICE_SIDES * DICE_ENCODE_ELEM + 1
+OBSERVATION_SIZE   = BOARD_LENGTH * BOARD_ENCODE_ELEM + BAR_POSITIONS + OFF_POSITIONS
 
 START_BOARD        = (2, 0, 0, 0, 0, -5, 0, -3, 0, 0, 0, 5, -5, 0, 0, 0, 3, 0, 5, 0, 0, 0, 0, -2)
 START_POSITIONS    = START_BOARD + (0, 0) + (0, 0)
@@ -82,7 +101,8 @@ EMPTY_ACTION_LOGITS   = jnp.full(ACTION_TOTAL_LENGTH, -jnp.inf, dtype=jnp.float3
 BOARD_DTYPE           = jnp.int8  # can store [-128, 127]
 MAT_MULT_DTYPE        = jnp.float16  # any fast and small dtype that is supported by hardware matrix mult units
 
-NOOP_ACTION_MASK      = jnp.zeros(ACTION_TOTAL_LENGTH, dtype=jnp.bool_).at[0].set(TRUE)
+NOOP_ACTION_IDX       = SRC_NO_MOVE * DICE_SIDES
+NOOP_ACTION_MASK      = jnp.zeros(ACTION_TOTAL_LENGTH, dtype=jnp.bool_).at[NOOP_ACTION_IDX].set(TRUE)
 BOARD_BAR_MASK        = jnp.zeros(ALL_GAME_POSITIONS, dtype=jnp.bool_).at[BAR_IDX].set(TRUE)
 
 MADE_POINT_HEURISTIC  = jnp.array([0.2, 0.2, 0.2, 0.4, 0.5, 0.5] + [0.4, 0.3, 0.2, 0.2, 0.2, 0.2]
@@ -208,10 +228,19 @@ ONE_MOVE_BOARD_DIFFS, ONE_MOVE_SRC, ONE_MOVE_DIE, ONE_MOVE_TGT, ACTION_SRC_BOARD
     _jit_initialize_arrays()
 )
 
+BOARD_DIFFS_PER_DIE = jnp.transpose(ONE_MOVE_BOARD_DIFFS.reshape(SRC_LENGTH, DICE_SIDES, ALL_GAME_POSITIONS), (1, 0, 2))
+SRC_PER_DIE = jnp.transpose(ONE_MOVE_SRC.reshape(SRC_LENGTH, DICE_SIDES), (1, 0))
+TGT_PER_DIE = jnp.transpose(ONE_MOVE_TGT.reshape(SRC_LENGTH, DICE_SIDES), (1, 0))
+SRC_BOARD_MASK_PER_DIE = jnp.transpose(ACTION_SRC_BOARD_MASK.reshape(SRC_LENGTH, DICE_SIDES, ALL_GAME_POSITIONS), (1, 0, 2))
+
+# The way the actions are arranged SRC_PER_DIE is the same for every die value
+SRC_ANY_DIE = SRC_PER_DIE[0]
+SRC_BOARD_MASK_ANY_DIE = SRC_BOARD_MASK_PER_DIE[0]
+
+
+
 
 OUTSIDE_HOME_BOARD_MASK = _board_mask_before_src(jnp.int32(BOARD_LENGTH - HOME_BOARD_LENGTH))
-DIFF_POS = (ONE_MOVE_BOARD_DIFFS > 0).astype(MAT_MULT_DTYPE)
-DIFF_NEG = (ONE_MOVE_BOARD_DIFFS < 0).astype(MAT_MULT_DTYPE)
 
 
 @dataclass
@@ -326,7 +355,7 @@ def _step(state: State, action: Array, key) -> State:
     )
 
 
-def _make_observation(board: Array, playable_dice_count: Array, current_player: Array, player_id: Array) -> Array:
+def _make_observation(board: Array) -> Array:
     """
     Use the gnu backgammon encoding (in eval.c) for the board state which
     is similar to the encoding used by TD Gammon.
@@ -334,6 +363,9 @@ def _make_observation(board: Array, playable_dice_count: Array, current_player: 
             afInput[1] = (nc == 2) ? 1.0f : 0.0f;
             afInput[2] = (nc >= 3) ? 1.0f : 0.0f;
             afInput[3] = nc > 3 ? (float) (nc - 3) / 2.0f : 0.0f;
+
+    Currently we do not include the dice because we assume that any strategy
+    will be evaluated on every legal board state.
     """
     board_pts = board[BOARD_RANGE[0]:BOARD_RANGE[1]]
     observations = [
@@ -347,9 +379,6 @@ def _make_observation(board: Array, playable_dice_count: Array, current_player: 
         1.0 * jnp.maximum(0.0, ((-board_pts - 3.0) / 2.0)),
         jnp.abs(board[BAR_RANGE[0]:BAR_RANGE[1]]) / 2.0,
         jnp.abs(board[OFF_RANGE[0]:OFF_RANGE[1]]) / PLAYER_CHECKERS,
-        (playable_dice_count >= 1).astype(jnp.float32),
-        jnp.clip(playable_dice_count - 1, 0, None) / (MAX_MOVES - 1),
-        1.0 * (player_id == current_player),
     ]
     ret = jnp.concatenate(observations, axis=None)
     return ret
@@ -370,12 +399,11 @@ def _to_playable_dice_count(playable_dice: Array) -> Array:
     return one_hot[playable_dice].sum(axis=0)
 
 
-def _observe(state: State, player_id: Array) -> Array:
-    playable_dice_count = _to_playable_dice_count(state._playable_dice)
-    return _make_observation(state._board, playable_dice_count, state.current_player, player_id)
+def _observe(state: State, _player_id: Array) -> Array:
+    return _make_observation(state._board)
 
 
-def _observation_to_board_and_dice(observation: Array) -> Array:
+def _observation_to_board(observation: Array) -> Array:
     """ this returns the board and an array of size 6 which has the playable dice for each die value """
     BLTH = BOARD_LENGTH
     BRNG = BOARD_RANGE
@@ -397,12 +425,7 @@ def _observation_to_board_and_dice(observation: Array) -> Array:
          jax.lax.round(obs[BLTH * 8 + 2] * PLAYER_CHECKERS),
         -jax.lax.round(obs[BLTH * 8 + 3] * PLAYER_CHECKERS)
     ], axis=None)
-    board = jnp.where(observation[OBSERVATION_SIZE - 1] > 0.0, board, _flip_board(board))
-    playable_dice_count = (
-          observation[OBSERVATION_SIZE - DICE_SIDES * 2 - 1:OBSERVATION_SIZE - DICE_SIDES * 1 - 1]
-        + observation[OBSERVATION_SIZE - DICE_SIDES * 1 - 1:OBSERVATION_SIZE - DICE_SIDES * 0 - 1] * (MAX_MOVES - 1)
-    )
-    return board, playable_dice_count
+    return board
 
 
 def _action_is_chance(action):
@@ -564,95 +587,183 @@ def _arr_black_checker_mask(board_arr: Array):
     return board_arr > 0
 
 
-def _arr_is_any_earlier(black_checker_mask: Array, src: Array) -> Array:
+def _arr_is_any_earlier(black_checker_mask: Array, src: Array, src_board_mask: Array = None) -> Array:
     """
     This checks if there are any black checkers before the src position of the relevant action
     (important when bearing off).
-
-    NOTE: If src is a scalar we compute the mask for that src.  Otherwise we assume that src is simply
-    the src for every legal action and we use the precomputed ACTION_SRC_BOARD_MASK.
     """
     if src.ndim == 0:
         return (black_checker_mask & _board_mask_before_src(src)).any(axis=-1)
 
-    assert src.shape == (ACTION_MOVE_LENGTH,), f"Expected shape of src to be {ACTION_MOVE_LENGTH}, got {src.shape}"
-    return (black_checker_mask.astype(MAT_MULT_DTYPE) @ ACTION_SRC_BOARD_MASK.T) > 0
+    if src_board_mask is None:
+        src_board_mask = jax.vmap(_board_mask_before_src)(src).astype(MAT_MULT_DTYPE)
+    return (black_checker_mask.astype(MAT_MULT_DTYPE) @ src_board_mask.T) > 0
 
 
 def _arr_is_illegal_on_board(board_arr, diff):
     assert board_arr.shape[-1] == ALL_GAME_POSITIONS, f"Expected last dimension of board_arr to be {ALL_GAME_POSITIONS}, got {board_arr.shape}"
 
-    is_illegal_hit_tgt = ((board_arr <= -2).astype(MAT_MULT_DTYPE) @ DIFF_POS.T) > 0
-    is_illegal_src     = ((board_arr <= 0).astype(MAT_MULT_DTYPE) @ DIFF_NEG.T) > 0
+    diff_pos = (diff > 0).astype(MAT_MULT_DTYPE)
+    diff_neg = (diff < 0).astype(MAT_MULT_DTYPE)
+    is_illegal_hit_tgt = ((board_arr <= -2).astype(MAT_MULT_DTYPE) @ diff_pos.T) > 0
+    is_illegal_src     = ((board_arr <= 0).astype(MAT_MULT_DTYPE) @ diff_neg.T) > 0
     return is_illegal_hit_tgt | is_illegal_src
 
 
-def _arr_is_illegal_off(black_checker_mask, src, tgt, die):
+def _arr_is_illegal_off(black_checker_mask, src, tgt, die, src_board_mask: Array = None):
     is_off              = (tgt == OFF_IDX)
-    is_any_earlier      = _arr_is_any_earlier(black_checker_mask, src)
+    is_any_earlier      = _arr_is_any_earlier(black_checker_mask, src, src_board_mask)
     is_all_home         = (black_checker_mask.astype(MAT_MULT_DTYPE) @ OUTSIDE_HOME_BOARD_MASK) == 0
     is_exact_off        = (BOARD_LENGTH - src) == die
     return is_off & ((~is_all_home)[..., jnp.newaxis] | ((~is_exact_off) & is_any_earlier))
 
 
-def _arr_apply_diff(board_arr: Array, diff: Array, src: Array, die: Array, tgt: Array) -> Array:
+def _arr_is_move_legal(board_arr: Array, diff: Array, src: Array, die: Array, tgt: Array, src_board_mask: Array = None) -> Array:
     """
     Apply board diffs to board_arr. Wherever diff is positive and board_arr has -1,
     the board_arr value is treated as 0 (simulating hit/blot removal).
     """
     is_illegal_on_board = _arr_is_illegal_on_board(board_arr, diff)
     black_checker_mask  = _arr_black_checker_mask(board_arr)
-    is_illegal_off      = _arr_is_illegal_off(black_checker_mask, src, tgt, die)
+    is_illegal_off      = _arr_is_illegal_off(black_checker_mask, src, tgt, die, src_board_mask)
 
     is_illegal_bar      = black_checker_mask[..., BAR_IDX][..., jnp.newaxis] & (src != BAR_IDX)
+    is_illegal_noop     = (src < 0)
 
-    is_illegal          = is_illegal_on_board | is_illegal_off | is_illegal_bar
-
+    is_illegal          = is_illegal_on_board | is_illegal_off | is_illegal_bar | is_illegal_noop
     return ~is_illegal
 
 
-def _arr_one_and_two_moves(board):
+def _deduplicate_boards(boards: Array, legal: Array, first_move: Array, limit: int) -> Tuple[Array, Array, Array]:
     """
-    This returns a (ACTION_TOTAL, ACTION_TOTAL, BOARD_LENGTH) array containing
-    all possible boards after two moves.  NOTE: the count of white checkers on
-    the bar (negative value at BAR_IDX + 1) is not updated by this.
+    Deduplicates a set of board states of shape (N, 28) with legality mask (N,),
+    returning exactly `limit` unique legal boards of shape (limit, 28), unique_legal mask (limit,),
+    and unique_first_move indices (limit,).
     """
-    one_move_legal = _arr_apply_diff(board, ONE_MOVE_BOARD_DIFFS, ONE_MOVE_SRC, ONE_MOVE_DIE, ONE_MOVE_TGT)
-    one_move_hit_tgt = (ONE_MOVE_BOARD_DIFFS > 0) & (board == -1)
+    # Sort lexicographically using 2 independent random 32-bit projection hashes.
+    # We use ~legal as the primary key (last in the tuple) so that legal boards (0) sort before illegal ones (1).
+    hash1 = (boards.astype(jnp.int32) * HASH_WEIGHTS_1).sum(axis=-1)
+    hash2 = (boards.astype(jnp.int32) * HASH_WEIGHTS_2).sum(axis=-1)
+    sort_keys = (hash1, hash2, (~legal).astype(jnp.int32))
+    sort_idx = jnp.lexsort(sort_keys)
 
-    # for positions where we just hit set the value to 1, if we don't make this fix the board will
-    # be the sum of the hit white checker (-1) and new black checker (+1) and will equal zero (empty position)
-    one_move_boards = jnp.where(one_move_hit_tgt, BOARD_DTYPE(1), board + ONE_MOVE_BOARD_DIFFS)
+    sorted_boards = boards[sort_idx]
+    sorted_legal = legal[sort_idx]
+    sorted_first_move = first_move[sort_idx]
 
-    two_move_legal  = _arr_apply_diff(one_move_boards, ONE_MOVE_BOARD_DIFFS, ONE_MOVE_SRC, ONE_MOVE_DIE, ONE_MOVE_TGT)
-    return one_move_legal, one_move_boards, two_move_legal
+    # Find duplicates (identical at all board positions)
+    is_duplicate = (sorted_boards[1:] == sorted_boards[:-1]).all(axis=-1)
+    is_duplicate = jnp.pad(is_duplicate, (1, 0), constant_values=False)
+
+    is_unique_legal = sorted_legal & (~is_duplicate)
+
+    gather_idx = jnp.nonzero(is_unique_legal, size=limit, fill_value=-1)[0]
+    safe_gather_idx = jnp.where(gather_idx == -1, 0, gather_idx)
+
+    unique_boards = sorted_boards[safe_gather_idx]
+    unique_boards = jnp.where(gather_idx[:, jnp.newaxis] == -1, BOARD_DTYPE(0), unique_boards)
+
+    unique_legal = (gather_idx != -1)
+
+    unique_first_move = sorted_first_move[safe_gather_idx]
+    unique_first_move = jnp.where(gather_idx == -1, -1, unique_first_move)
+
+    return unique_boards, unique_legal, unique_first_move
+
+
+def _arr_make_new_boards(board: Array, diffs: Array) -> Array:
+    hit_tgt = (diffs > 0) & (board == -1)
+    new_boards = jnp.where(hit_tgt, BOARD_DTYPE(1), board + diffs)
+
+    # Vectorized update of the white bar count (index BAR_IDX + 1) for each candidate board
+    hits_per_candidate = hit_tgt.sum(axis=-1).astype(BOARD_DTYPE)
+    new_boards         = new_boards - hits_per_candidate[..., jnp.newaxis] * (jnp.arange(ALL_GAME_POSITIONS, dtype=BOARD_DTYPE) == BAR_IDX + 1)
+
+    return new_boards
+
+
+def _arr_step_one_move_dice_actions(board: Array, die_idx: int) -> Tuple[Array, Array]:
+    diffs = BOARD_DIFFS_PER_DIE[die_idx]
+    tgt = TGT_PER_DIE[die_idx]
+    src = SRC_ANY_DIE
+    mask = SRC_BOARD_MASK_ANY_DIE
+    die = jnp.full(SRC_LENGTH, die_idx + 1, dtype=BOARD_DTYPE)
+    new_boards = _arr_make_new_boards(board, diffs)
+
+    legal = _arr_is_move_legal(board, diffs, src, die, tgt, mask)
+    return legal, new_boards
+
+
+def _arr_one_and_two_moves(board, sorted_dice):
+    die1_idx = jnp.clip(sorted_dice[-1], 1, 6) - 1
+    die2_idx = jnp.clip(sorted_dice[-2], 1, 6) - 1
+
+    # First move legality and boards (reusing _arr_step_one_move)
+    legal_die1, boards_die1 = _arr_step_one_move_dice_actions(board, die1_idx)
+    legal_die2, boards_die2 = _arr_step_one_move_dice_actions(board, die2_idx)
+
+    one_move_legal  = jnp.concatenate([legal_die1, legal_die2], axis=0)
+    one_move_boards = jnp.concatenate([boards_die1, boards_die2], axis=0)
+
+    # Second move legality (pairwise 52 x 52)
+    legal_d2_given_d1, _ = jax.vmap(lambda b: _arr_step_one_move_dice_actions(b, die2_idx))(boards_die1)
+    legal_d1_given_d2, _ = jax.vmap(lambda b: _arr_step_one_move_dice_actions(b, die1_idx))(boards_die2)
+
+    top_half       = jnp.concatenate([jnp.zeros((SRC_LENGTH, SRC_LENGTH), dtype=jnp.bool_), legal_d2_given_d1], axis=-1)
+    bottom_half    = jnp.concatenate([legal_d1_given_d2, jnp.zeros((SRC_LENGTH, SRC_LENGTH), dtype=jnp.bool_)], axis=-1)
+    two_move_legal = jnp.concatenate([top_half, bottom_half], axis=0)
+
+    # return handy values for further computation
+    candidate_action_indices = jnp.concatenate([jnp.arange(SRC_LENGTH) * 6 + die1_idx, jnp.arange(SRC_LENGTH) * 6 + die2_idx], axis=0)
+    candidate_diffs          = jnp.concatenate([BOARD_DIFFS_PER_DIE[die1_idx], BOARD_DIFFS_PER_DIE[die2_idx]], axis=0) # shape: (52, 28)
+    candidate_tgt            = jnp.concatenate([TGT_PER_DIE[die1_idx], TGT_PER_DIE[die2_idx]], axis=0)       # shape: (52,)
+
+    return one_move_legal, one_move_boards, two_move_legal, candidate_action_indices, candidate_tgt, candidate_diffs
 
 
 def _arr_legal_action_mask_details(board: Array, playable_dice: Array):
-    one_move_legal, one_move_boards, two_move_legal = _arr_one_and_two_moves(board)
-
+    """
+    I have not proven mathematically but I believe that for double rolls it is
+    sufficient to look two moves ahead.  The "must use the larger die" and
+    other subtleties do not come up when every move has the same dice value.
+    """
     sorted_dice = jnp.sort(jnp.where(playable_dice == NO_MOVE, NO_MOVE - 1, playable_dice + 1))
+
+    one_move_legal_per_die, one_move_boards_per_die, two_move_legal_raw_per_die, candidate_action_indices, candidate_tgt, candidate_diffs = \
+        _arr_one_and_two_moves(board, sorted_dice)
 
     first_dice  = sorted_dice[-1]  # larger dice
     second_dice = sorted_dice[-2]  # can be NO_MOVE - 1
 
-    move1_die1_legal   = one_move_legal & (ONE_MOVE_DIE == first_dice)
-    move1_die2_legal   = one_move_legal & (ONE_MOVE_DIE == second_dice)
+    first_dice_valid  = (first_dice >= 1)
+    second_dice_valid = (second_dice >= 1)
 
-    move2_die1_legal   = two_move_legal & (ONE_MOVE_DIE == first_dice)[jnp.newaxis, :]
-    move2_die2_legal   = two_move_legal & (ONE_MOVE_DIE == second_dice)[jnp.newaxis, :]
+    candidate_die_is_first = jnp.concatenate([
+        jnp.ones(SRC_LENGTH, dtype=jnp.bool_),
+        jnp.zeros(SRC_LENGTH, dtype=jnp.bool_)
+    ])
+    candidate_die_is_second = ~candidate_die_is_first
 
-    two_move_legal_w_dice = (move1_die1_legal[:, jnp.newaxis] & move2_die2_legal) | (move1_die2_legal[:, jnp.newaxis] & move2_die1_legal)
-    one_move_fallback  = jnp.where(move1_die1_legal.any(), move1_die1_legal, move1_die2_legal)
+    move1_die1_legal   = one_move_legal_per_die & candidate_die_is_first & first_dice_valid
+    move1_die2_legal   = one_move_legal_per_die & candidate_die_is_second & second_dice_valid
 
-    return one_move_fallback, one_move_boards, two_move_legal_w_dice
+    move2_die1_legal   = two_move_legal_raw_per_die & candidate_die_is_first[jnp.newaxis, :] & first_dice_valid
+    move2_die2_legal   = two_move_legal_raw_per_die & candidate_die_is_second[jnp.newaxis, :] & second_dice_valid
+
+    two_move_legal_per_die = (move1_die1_legal[:, jnp.newaxis] & move2_die2_legal) | (move1_die2_legal[:, jnp.newaxis] & move2_die1_legal)
+    one_move_legal_per_die  = jnp.where(move1_die1_legal.any(), move1_die1_legal, move1_die2_legal)
+
+    return one_move_legal_per_die, one_move_boards_per_die, two_move_legal_per_die, candidate_action_indices, sorted_dice, candidate_tgt, candidate_diffs
 
 
 def _arr_legal_action_mask(board: Array, playable_dice: Array) -> Array:
-    one_move_fallback, one_move_boards, two_move_legal_w_dice = _arr_legal_action_mask_details(board, playable_dice)
-    any_two_moves      = two_move_legal_w_dice.any()
-    legal_moves        = jnp.where(any_two_moves, two_move_legal_w_dice.any(axis=-1), one_move_fallback)
+    one_move_legal_per_die, one_move_boards_per_die, two_move_legal_per_die, candidate_action_indices, sorted_dice, candidate_tgt, candidate_diffs = \
+        _arr_legal_action_mask_details(board, playable_dice)
+    any_two_moves      = two_move_legal_per_die.any()
+    legal_moves_per_die = jnp.where(any_two_moves, two_move_legal_per_die.any(axis=-1), one_move_legal_per_die)
 
+    legal_moves_int = jnp.zeros(ACTION_MOVE_LENGTH, dtype=jnp.int32).at[candidate_action_indices].add(legal_moves_per_die.astype(jnp.int32))
+    legal_moves = (legal_moves_int > 0)
     legal_moves_padded = jnp.pad(legal_moves, (0, ACTION_CHANCE_LENGTH), constant_values=False)
 
     return jnp.where(legal_moves.any(), legal_moves_padded, NOOP_ACTION_MASK)
@@ -1074,60 +1185,13 @@ def _flexibility_heuristic(board):
 
 @dataclass
 class SimpleBackgammonEvaluatorConfig:
-    pip_diff_weight: Array = jnp.float32(0.05)
-    born_off_weight: Array = jnp.float32(3.5)
+    pip_diff_weight: Array = jnp.float32(0.035)
+    born_off_weight: Array = jnp.float32(4.0)
     made_points_home_weight: Array = jnp.float32(1.1)
-    made_points_weight: Array = jnp.float32(5.0)
-    blots_weight: Array = jnp.float32(0.2)
-    bar_weight: Array = jnp.float32(0.25)      # this was not yet updated
-    flexibility_weight: Array = jnp.float32(0.5)
-
-
-
-#    pip_diff_weight: Array = jnp.float32(0.11)
-#    born_off_weight: Array = jnp.float32(0.9)
-#    made_points_home_weight: Array = jnp.float32(0.54)
-#    made_points_weight: Array = jnp.float32(0.51)
-#    blots_weight: Array = jnp.float32(0.17)
-#    bar_weight: Array = jnp.float32(0.2)
-#    no_contact_home_board_weight: Array = jnp.float32(0.2)
-#    no_contact_pip_diff_weight: Array = jnp.float32(1.0)    # pip diff is overriding factor when deciding whether to initiate end game
-#    dancing_weight: Array = jnp.float32(0.4)
-#    flexibility_weight: Array = jnp.float32(0.59)
-#    prime_weight: Array = jnp.float32(1.05)
-#    prime_checker_offset: Array = jnp.float32(1.45)
-#    prime_reward: Array = jnp.array([0.0, 0.03, 0.06, 0.2, 0.3, 0.5, 1.0, 1.0], dtype=jnp.float32)
-
-#    pip_diff_weight: Array = jnp.float32(0.76)
-#    born_off_weight: Array = jnp.float32(3.50)
-#    made_points_home_weight: Array = jnp.float32(1.19)
-#    made_points_weight: Array = jnp.float32(3.8)
-#    blots_weight: Array = jnp.float32(0.33)
-#    blots_hit_weight: Array = jnp.float32(0.33)
-#    bar_weight: Array = jnp.float32(0.42)
-#    no_contact_home_board_weight: Array = jnp.float32(1.07)
-#    no_contact_pip_diff_weight: Array = jnp.float32(0.84)
-#    dancing_weight: Array = jnp.float32(0.36)
-#    flexibility_weight: Array = jnp.float32(0.90)
-#    prime_weight: Array = jnp.float32(0.53)
-#    prime_checker_offset: Array = jnp.float32(1.3)
-#    prime_reward: Array = jnp.array([0.0, 0.03, 0.06, 0.2, 0.3, 0.5, 1.0, 1.0], dtype=jnp.float32)
-
-#    pip_diff_weight: Array = jnp.float32(0.76)
-#    born_off_weight: Array = jnp.float32(2.00)
-#    made_points_home_weight: Array = jnp.float32(0.6)
-#    made_points_weight: Array = jnp.float32(3.8)
-#    blots_weight: Array = jnp.float32(0.1)    # TODO zero
-#    blots_hit_weight: Array = jnp.float32(0.1)    # TODO zero
-#    bar_weight: Array = jnp.float32(0.1)    # TODO zero
-#    no_contact_home_board_weight: Array = jnp.float32(0.5)
-#    no_contact_pip_diff_weight: Array = jnp.float32(0.5)
-#    dancing_weight: Array = jnp.float32(0.36)
-#    flexibility_weight: Array = jnp.float32(0.30)
-#    prime_weight: Array = jnp.float32(0.3)
-#    prime_checker_offset: Array = jnp.float32(0.6)
-#    prime_reward: Array = jnp.array([0.0, 0.03, 0.06, 0.2, 0.3, 0.5, 1.0, 1.0], dtype=jnp.float32)
-
+    made_points_weight: Array = jnp.float32(6.4)
+    blots_weight: Array = jnp.float32(0.21)
+    bar_weight: Array = jnp.float32(0.28)
+    flexibility_weight: Array = jnp.float32(0.61)
 
 
 class SimpleBackgammonEvaluator(core.Evaluator):
@@ -1141,7 +1205,7 @@ class SimpleBackgammonEvaluator(core.Evaluator):
 
     def eval(self, state: State) -> Array:
         # in this case we know the internals of the state so grab the board directly
-        #board, playable_dice_count = jax.vmap(_observation_to_board_and_dice)(state.observations)
+        #board = jax.vmap(_observation_to_board)(state.observations)
         board = state._board
 
         my_born_off = board[:, OFF_IDX]
@@ -1167,74 +1231,6 @@ class SimpleBackgammonEvaluator(core.Evaluator):
         return estimated_equity
 
 
-    def eval_old(self, observations: Array) -> Array:
-        """
-        Input: pgx backgammon observation batch matrix shape [B, OBSERVATION_SIZE]
-        Returns: Roughly estimated equity array shape [B]
-
-        TODO other possible simple features:
-         - smoothly reweight features based on whether we want to race
-           or make contact
-         - feed the probability of being hit into the other features as an expected
-           number of checkers on the bar
-         - in the end game give value to having evenly distributed checkers on
-           as many board positions as possible
-         - extra good to have two or more on the bar
-         - use lower level features like freedom (how much work do your farthest back checkers
-           have to do to get to the end game), some of these are situationally dependent
-           (eg freedom is important if you are ahead in the race)
-        """
-        board, playable_dice_count = jax.vmap(_observation_to_board_and_dice)(observations)
-
-        my_born_off = board[:, OFF_IDX]
-        opp_born_off = -board[:, OFF_IDX + 1]
-        my_bar_heuristic = -board[:, BAR_IDX]     # negate because having a checker on the bar is bad
-        opp_bar_heuristic = board[:, BAR_IDX + 1]
-
-        pip_diff = _calc_pip_diff(board)
-        my_made_points, opp_made_points = _calc_made_points(board)
-        my_points_heuristic, opp_points_heuristic = _calc_made_points_heuristic(board)
-        my_blots_heuristic, opp_blots_heuristic = _calc_blots_heuristic(board)
-        my_blots_hit_heuristic, opp_blots_hit_heuristic = _calc_blots_hit_heuristic(board)
-        my_home_count, opp_home_count = _calc_no_contact_home_board_count(board)
-        my_dancing_heuristic, opp_dancing_heuristic = _calc_dancing_heuristic(board)
-        my_flexibility_heuristic, opp_flexibility_heuristic = _flexibility_heuristic(board)
-
-        my_prime_heuristic, opp_prime_heuristic = _calc_prime_heuristic(board, self.config.prime_checker_offset, self.config.prime_reward)
-
-        always = (
-            + (my_born_off - opp_born_off) * self.config.born_off_weight
-        )
-        before_no_contact = (
-            + (pip_diff * self.config.pip_diff_weight)
-            + (my_bar_heuristic - opp_bar_heuristic) * self.config.bar_weight
-            + (my_made_points - opp_made_points) * self.config.made_points_home_weight
-            + (my_points_heuristic - opp_points_heuristic) * self.config.made_points_weight
-            + (my_blots_heuristic - opp_blots_heuristic) * self.config.blots_weight
-            + (my_blots_hit_heuristic - opp_blots_hit_heuristic) * self.config.blots_hit_weight
-            + (my_prime_heuristic - opp_prime_heuristic) * self.config.prime_weight
-            + (my_dancing_heuristic - opp_dancing_heuristic) * self.config.dancing_weight
-            + (my_flexibility_heuristic - opp_flexibility_heuristic) * self.config.flexibility_weight
-        )
-        during_no_contact = (
-            + (pip_diff * self.config.no_contact_pip_diff_weight)
-            + (my_home_count - opp_home_count) * self.config.no_contact_home_board_weight
-        )
-
-        estimated_equity = always + jnp.where(_is_no_contact(board), during_no_contact, before_no_contact)
-        return estimated_equity
-
-
-def _board_to_observation(board: Array) -> Array:
-    flat_board = board.reshape((-1, 28))
-    dummy_dice = jnp.zeros(6, dtype=jnp.float32)
-    dummy_player = jnp.int32(0)
-    flat_obs = jax.vmap(
-        lambda b: _make_observation(b, dummy_dice, dummy_player, dummy_player)
-    )(flat_board)
-    return flat_obs.reshape(board.shape[:-1] + (OBSERVATION_SIZE,))
-
-
 def _evaluate_boards(boards: Array, mask: Array, model) -> Array:
     orig_shape = boards.shape[:-1]
     flat_boards = boards.reshape((-1, ALL_GAME_POSITIONS))
@@ -1245,76 +1241,250 @@ def _evaluate_boards(boards: Array, mask: Array, model) -> Array:
 
 
 class BackgammonTwoPlyStrategy(core.Strategy):
-    CHUNK_SIZE = 12
-    NUM_CHUNKS = 13
+    CHUNK_SIZE = 13
+    NUM_CHUNKS = 4
 
     def __init__(self, env):
         self.env = env
         # if this is not true we need to add code to use padding
-        assert self.CHUNK_SIZE * self.NUM_CHUNKS == ACTION_MOVE_LENGTH
+        assert self.CHUNK_SIZE * self.NUM_CHUNKS == 2 * SRC_LENGTH
 
-    def get_next_action(self, state: core.State, _rng_key: Array, config, model_cls) -> Array:
-        # Get details from helper
-        one_move_fallback, one_move_boards, two_move_legal_w_dice = \
-            jax.vmap(_arr_legal_action_mask_details)(state._board, state._playable_dice)
-
+    def _evaluate_2ply_details(self, state: core.State, config, model_cls):
+        assert state.current_player.ndim == 1, 'state must be a batched state (jax pytree)'
         B = state.current_player.shape[0]
 
-        # Broadcast config to B * ACTION_MOVE_LENGTH for 1-ply evaluation
-        broad_config = core.broadcast_config(config, ACTION_MOVE_LENGTH)
+        one_move_legal_per_die, one_move_boards_per_die, two_move_legal_per_die, candidate_action_indices, sorted_dice, candidate_tgt, candidate_diffs = \
+            jax.vmap(_arr_legal_action_mask_details)(state._board, state._playable_dice)
+
+        # Broadcast config to B * 2 * SRC_LENGTH for 1-ply evaluation
+        broad_config = core.broadcast_config(config, 2 * SRC_LENGTH)
         model_1ply = model_cls(broad_config)
 
-        # Broadcast config to B * CHUNK_SIZE * ACTION_MOVE_LENGTH for 2-ply evaluation
-        config_2ply = core.broadcast_config(config, self.CHUNK_SIZE * ACTION_MOVE_LENGTH)
+        # Broadcast config to B * CHUNK_SIZE * 2 * SRC_LENGTH for 2-ply evaluation
+        config_2ply = core.broadcast_config(config, self.CHUNK_SIZE * 2 * SRC_LENGTH)
         model_2ply = model_cls(config_2ply)
 
-        # 1. 1-move evaluation (using helper)
-        one_move_equities = _evaluate_boards(one_move_boards, one_move_fallback, model_1ply) # shape: (B, 156)
-        best_one_move_action = jnp.argmax(one_move_equities, axis=-1) # shape: (B,)
+        # 1. 1-move evaluation
+        one_move_equities = _evaluate_boards(one_move_boards_per_die, one_move_legal_per_die, model_1ply) # shape: (B, 52)
+        best_one_move_action_idx = jnp.argmax(one_move_equities, axis=-1) # shape: (B,)
+        best_one_move_action = candidate_action_indices[jnp.arange(B), best_one_move_action_idx]
 
-        # 2. 2-move evaluation in chunks of 12 along the 156 first actions
-        chunk_boards = one_move_boards.transpose((1, 0, 2)).reshape((self.NUM_CHUNKS, self.CHUNK_SIZE, B, ALL_GAME_POSITIONS))
-        chunk_legal = two_move_legal_w_dice.transpose((1, 0, 2)).reshape((self.NUM_CHUNKS, self.CHUNK_SIZE, B, ACTION_MOVE_LENGTH))
+        # 2. 2-move evaluation in chunks of 13 along the 52 first actions
+        chunk_boards = one_move_boards_per_die.transpose((1, 0, 2)).reshape((self.NUM_CHUNKS, self.CHUNK_SIZE, B, ALL_GAME_POSITIONS))
+        chunk_legal = two_move_legal_per_die.transpose((1, 0, 2)).reshape((self.NUM_CHUNKS, self.CHUNK_SIZE, B, 2 * SRC_LENGTH))
 
         def map_fn(inputs):
             boards, legal = inputs
 
-            # boards shape: (12, B, 28), aka (CHUNK_SIZE, B, ALL_GAME_POSITIONS)
-            # boards_at_tgt represents the board values at the target position for all 156 actions
-            boards_at_tgt = boards[..., ONE_MOVE_TGT]  # shape: (12, B, 156)
-
-            # A hit occurs if the target has exactly 1 opponent checker (value -1)
-            # Transpose boards_at_tgt to (12, 156, B) and expand to (12, 156, B, 1)
-            is_hit_at_tgt = (boards_at_tgt.transpose((0, 2, 1))[..., jnp.newaxis] == -1)
-
-            # Mask to only apply the hit logic to the specific target index of the action
-            # (ONE_MOVE_BOARD_DIFFS > 0) has shape (156, 28)
-            diff_pos = (ONE_MOVE_BOARD_DIFFS > 0)[jnp.newaxis, :, jnp.newaxis, :] # shape: (1, 156, 1, 28)
-
-            # Combine to shape (12, 156, B, 28)
-            is_hit = is_hit_at_tgt & diff_pos
-
-            two_move_boards = jnp.where(
-                is_hit,
-                BOARD_DTYPE(1),
-                boards[:, jnp.newaxis, :, :] + ONE_MOVE_BOARD_DIFFS[jnp.newaxis, :, jnp.newaxis, :]
+            two_move_boards = _arr_make_new_boards(
+                boards[:, jnp.newaxis, :, :],
+                candidate_diffs.transpose((1, 0, 2))[jnp.newaxis, :, :, :]
             )
 
-            flat_two_move_boards = two_move_boards.transpose((2, 0, 1, 3)).reshape((B, self.CHUNK_SIZE * ACTION_MOVE_LENGTH, ALL_GAME_POSITIONS))
-            flat_legal = legal.transpose((1, 0, 2)).reshape((B, self.CHUNK_SIZE * ACTION_MOVE_LENGTH))
+            flat_two_move_boards = two_move_boards.transpose((2, 0, 1, 3)).reshape((B, self.CHUNK_SIZE * 2 * SRC_LENGTH, ALL_GAME_POSITIONS))
+            flat_legal = legal.transpose((1, 0, 2)).reshape((B, self.CHUNK_SIZE * 2 * SRC_LENGTH))
 
-            flat_equities = _evaluate_boards(flat_two_move_boards, flat_legal, model_2ply) # shape: (B, self.CHUNK_SIZE * ACTION_MOVE_LENGTH)
+            flat_equities = _evaluate_boards(flat_two_move_boards, flat_legal, model_2ply) # shape: (B, self.CHUNK_SIZE * 52)
 
-            chunk_equities = flat_equities.reshape((B, self.CHUNK_SIZE, ACTION_MOVE_LENGTH)).transpose((1, 0, 2))
+            chunk_equities = flat_equities.reshape((B, self.CHUNK_SIZE, 2 * SRC_LENGTH)).transpose((1, 0, 2))
             return chunk_equities
 
         chunked_equities = jax.lax.map(map_fn, (chunk_boards, chunk_legal))
 
-        two_move_equities = chunked_equities.reshape((ACTION_MOVE_LENGTH, B, ACTION_MOVE_LENGTH)).transpose((1, 0, 2))
+        two_move_equities = chunked_equities.reshape((2 * SRC_LENGTH, B, 2 * SRC_LENGTH)).transpose((1, 0, 2))
 
         best_second_move_equity = jnp.max(two_move_equities, axis=-1)
-        best_two_move_first_action = jnp.argmax(best_second_move_equity, axis=-1) # shape: (B,)
+        best_two_move_first_action_idx = jnp.argmax(best_second_move_equity, axis=-1) # shape: (B,)
+        best_two_move_first_action = candidate_action_indices[jnp.arange(B), best_two_move_first_action_idx]
 
-        has_two_moves_legal = two_move_legal_w_dice.any(axis=(1, 2))
+        has_two_moves_legal = two_move_legal_per_die.any(axis=(-2, -1))
+        has_one_move_legal = one_move_legal_per_die.any(axis=-1)
 
-        return jnp.where(has_two_moves_legal, best_two_move_first_action, best_one_move_action)
+        best_action_nd = jnp.select([has_two_moves_legal, has_one_move_legal],
+                                    [best_two_move_first_action, best_one_move_action],
+                                    default=NOOP_ACTION_IDX)
+
+        return (
+            one_move_legal_per_die,
+            one_move_boards_per_die,
+            two_move_legal_per_die,
+            candidate_action_indices,
+            sorted_dice,
+            candidate_tgt,
+            candidate_diffs,
+            best_action_nd
+        )
+
+    def get_next_action_batch(self, state: core.State, _rng_key: Array, config, model_cls) -> Array:
+        """ this assumes that state is a jax pytree which has B states """
+        _, _, _, _, _, _, _, best_action_nd = self._evaluate_2ply_details(state, config, model_cls)
+        return best_action_nd
+
+
+class BackgammonFullTurnStrategy(core.Strategy):
+    LIMIT_2_MOVES = 120
+    LIMIT_3_MOVES = 680
+    LIMIT_4_MOVES = 3060
+
+    COMBINATIONS_2_MOVES_D = 676
+    COMBINATIONS_3_MOVES = 3120
+    COMBINATIONS_4_MOVES = 17680
+
+    CHUNK_SIZE_3_MOVES = 20
+    NUM_CHUNKS_3_MOVES = 34
+    CHUNK_SIZE_4_MOVES = 30
+    NUM_CHUNKS_4_MOVES = 102
+
+    def __init__(self, env):
+        self.env = env
+        self.two_ply_strategy = BackgammonTwoPlyStrategy(env)
+
+    def _propagate_lookahead_step(self, unique_boards_prev, unique_legal_prev, unique_first_move_prev, candidate_diffs, candidate_die, candidate_tgt, limit_next, combinations_next):
+        B = unique_boards_prev.shape[0]
+
+        # 1. Generate candidate boards
+        boards_next = _arr_make_new_boards(unique_boards_prev[:, :, jnp.newaxis, :], candidate_diffs[:, jnp.newaxis, :SRC_LENGTH, :])
+
+        # 2. Legality check for the step
+        def check_legality(boards_prev_single, diffs_single, die_single, tgt_single):
+            legals = jax.vmap(
+                lambda b: _arr_is_move_legal(b, diffs_single, SRC_ANY_DIE, die_single, tgt_single, SRC_BOARD_MASK_ANY_DIE)
+            )(boards_prev_single)
+            return legals
+
+        legals_next = jax.vmap(check_legality)(unique_boards_prev, candidate_diffs[:, :SRC_LENGTH], candidate_die[:, :SRC_LENGTH], candidate_tgt[:, :SRC_LENGTH])
+
+        # 3. Combine legality masks
+        flat_boards_next = boards_next.reshape((B, combinations_next, ALL_GAME_POSITIONS))
+        flat_legal_next = (unique_legal_prev[:, :, jnp.newaxis] & legals_next).reshape((B, combinations_next))
+
+        # 4. Propagate first move action indices
+        first_move_next = jnp.repeat(unique_first_move_prev[:, :, jnp.newaxis], SRC_LENGTH, axis=-1).reshape((B, combinations_next))
+
+        # 5. Deduplicate
+        unique_boards_next, unique_legal_next, unique_first_move_next = jax.vmap(
+            lambda b, l, fm: _deduplicate_boards(b, l, fm, limit_next)
+        )(flat_boards_next, flat_legal_next, first_move_next)
+
+        return unique_boards_next, unique_legal_next, unique_first_move_next
+
+    def _evaluate_unique_boards(self, unique_boards, unique_legal, limit, chunk_size, num_chunks, config, model_cls):
+        """ evaluate chunks of boards within the unique_boards, stop early when a chunk has no valid boards """
+        B = unique_boards.shape[0]
+        chunk_boards = unique_boards.transpose((1, 0, 2)).reshape((num_chunks, chunk_size, B, ALL_GAME_POSITIONS))
+        chunk_legal = unique_legal.transpose((1, 0)).reshape((num_chunks, chunk_size, B))
+
+        model = model_cls(core.broadcast_config(config, chunk_size))
+
+        init_equities = jnp.full((num_chunks, B, chunk_size), jnp.finfo(jnp.float32).min, dtype=jnp.float32)
+
+        def cond_fn(val):
+            c, _ = val
+            cond_chunks = c < num_chunks
+            safe_c = jnp.minimum(c, num_chunks - 1)
+            cond_legal = chunk_legal[safe_c].any()
+            return cond_chunks & cond_legal
+
+        def body_fn(val):
+            c, equities = val
+            boards = chunk_boards[c]
+            legal = chunk_legal[c]
+
+            flat_boards = boards.transpose((1, 0, 2)).reshape((-1, ALL_GAME_POSITIONS))
+            dummy_state = State(_board=flat_boards)
+            flat_equities = model.eval(dummy_state)
+            equities_chunk = flat_equities.reshape((B, chunk_size))
+            equities_chunk = jnp.where(legal.T, equities_chunk, jnp.finfo(equities_chunk.dtype).min)
+
+            equities = equities.at[c].set(equities_chunk)
+            return c + 1, equities
+
+        _, final_equities = jax.lax.while_loop(cond_fn, body_fn, (0, init_equities))
+
+        equities = final_equities.transpose((1, 0, 2)).reshape((B, limit)) # shape: (B, limit)
+
+        return equities
+
+    def get_next_action_batch(self, state: core.State, _rng_key: Array, config, model_cls) -> Array:
+        """ this assumes that state is a jax pytree which has B states """
+        assert state.current_player.ndim == 1, 'state must be a batched state (jax pytree)'
+        B = state.current_player.shape[0]
+
+        # 1. 2-Ply lookahead search details and non-double action
+        one_move_legal_per_die, one_move_boards_per_die, two_move_legal_per_die, candidate_action_indices, sorted_dice, candidate_tgt, candidate_diffs, best_action_nd = \
+            self.two_ply_strategy._evaluate_2ply_details(state, config, model_cls)
+
+        # For doubles, the die value is the same for all 4 moves.
+        double_die_value = sorted_dice[:, -1, jnp.newaxis] # shape: (B, 1)
+        candidate_die = jnp.full((B, SRC_LENGTH), double_die_value, dtype=BOARD_DTYPE)
+
+        # We only use the active double roll die (first SRC_LENGTH candidates)
+        # Move 2 (COMBINATIONS_2_MOVES_D combinations)
+        boards_d = _arr_make_new_boards(one_move_boards_per_die[:, :SRC_LENGTH][:, :, jnp.newaxis, :], candidate_diffs[:, jnp.newaxis, :SRC_LENGTH, :])
+
+        flat_boards_d = boards_d.reshape((B, self.COMBINATIONS_2_MOVES_D, ALL_GAME_POSITIONS))
+
+        # We only consider actual legal Move 2s (no propagation)
+        two_move_legal_doubles = two_move_legal_per_die[:, :SRC_LENGTH, SRC_LENGTH:2*SRC_LENGTH]
+        flat_legal_d = two_move_legal_doubles.reshape((B, self.COMBINATIONS_2_MOVES_D))
+
+        first_move_idx_d = jnp.repeat(jnp.arange(SRC_LENGTH)[:, jnp.newaxis], SRC_LENGTH, axis=-1).flatten()
+        first_move_d = jnp.tile(first_move_idx_d[jnp.newaxis, :], (B, 1))
+
+        # Deduplicate to LIMIT_2_MOVES boards
+        unique_boards_2, unique_legal_2, unique_first_move_2 = jax.vmap(
+            lambda b, l, fm: _deduplicate_boards(b, l, fm, self.LIMIT_2_MOVES)
+        )(flat_boards_d, flat_legal_d, first_move_d)
+
+        # Move 3 propagation
+        unique_boards_3, unique_legal_3, unique_first_move_3 = self._propagate_lookahead_step(
+            unique_boards_2, unique_legal_2, unique_first_move_2,
+            candidate_diffs, candidate_die, candidate_tgt,
+            self.LIMIT_3_MOVES, self.COMBINATIONS_3_MOVES
+        )
+
+        # Chunked evaluation for Move 3
+        move3_equities = self._evaluate_unique_boards(
+            unique_boards_3, unique_legal_3,
+            self.LIMIT_3_MOVES, self.CHUNK_SIZE_3_MOVES, self.NUM_CHUNKS_3_MOVES,
+            config, model_cls
+        )
+
+        # Find best 3-move action
+        best_3_idx = jnp.argmax(move3_equities, axis=-1)
+        best_3_first_move_idx = jax.vmap(lambda fm, idx: fm[idx])(unique_first_move_3, best_3_idx)
+        best_action_3 = candidate_action_indices[jnp.arange(B), best_3_first_move_idx]
+
+        # Move 4 propagation
+        unique_boards_4, unique_legal_4, unique_first_move_4 = self._propagate_lookahead_step(
+            unique_boards_3, unique_legal_3, unique_first_move_3,
+            candidate_diffs, candidate_die, candidate_tgt,
+            self.LIMIT_4_MOVES, self.COMBINATIONS_4_MOVES
+        )
+
+        # Chunked evaluation for Move 4
+        move4_equities = self._evaluate_unique_boards(
+            unique_boards_4, unique_legal_4,
+            self.LIMIT_4_MOVES, self.CHUNK_SIZE_4_MOVES, self.NUM_CHUNKS_4_MOVES,
+            config, model_cls
+        )
+
+        # Find best double action
+        best_4_idx = jnp.argmax(move4_equities, axis=-1)
+        best_4_first_move_idx = jax.vmap(lambda fm, idx: fm[idx])(unique_first_move_4, best_4_idx)
+        best_action_4 = candidate_action_indices[jnp.arange(B), best_4_first_move_idx]
+
+        # -------------------------------------------------------------
+        # 3. Action Selection
+        # -------------------------------------------------------------
+        has_3_moves = (sorted_dice[:, -3] >= 1)
+        has_4_moves = (sorted_dice[:, -4] >= 1)
+        has_3_moves_legal = unique_legal_3.any(axis=-1)
+        has_4_moves_legal = unique_legal_4.any(axis=-1)
+
+        final_action = jnp.select(
+            [has_4_moves & has_4_moves_legal, has_3_moves & has_3_moves_legal],
+            [best_action_4, best_action_3],
+            default=best_action_nd
+        )
+        return final_action

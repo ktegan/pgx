@@ -138,7 +138,7 @@ def play_games_jax(batch_size, env_id, model_cls, rng_key, model_params, p0_indi
         key, key1, key2 = jax.random.split(key, 3)
         chance_action = jax.random.categorical(key1, chance_logits, axis=-1)
 
-        move_action = strategy.get_next_action(state, key2, active_params, model_cls)
+        move_action = strategy.get_next_action_batch(state, key2, active_params, model_cls)
         action = jnp.where(is_chance_node, chance_action, move_action)
 
         key, step_rng = jax.random.split(key)

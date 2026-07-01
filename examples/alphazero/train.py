@@ -47,8 +47,8 @@ class Config(BaseModel):
     seed: int = 0
     max_num_iters: int = 400
     # network params
-    num_channels: int = 128   # aka filters
-    num_layers: int = 6       # aka residual blocks
+    num_channels: int = 256   # aka filters
+    num_layers: int = 12       # aka residual blocks
     resnet_v2: bool = True
     # selfplay params
     selfplay_batch_size: int = 1024
@@ -59,6 +59,7 @@ class Config(BaseModel):
     learning_rate: float = 0.001
     # eval params
     eval_interval: int = 5
+    load_checkpoint_path: str = ""
 
     class Config:
         extra = "forbid"
@@ -291,6 +292,18 @@ if __name__ == "__main__":
     dummy_input = dummy_state.observation
     model = forward.init(jax.random.PRNGKey(0), dummy_input)  # (params, state)
     opt_state = optimizer.init(params=model[0])
+
+    if config.load_checkpoint_path:
+        if jax.process_index() == 0:
+            print(f"Loading checkpoint from {config.load_checkpoint_path}...")
+        with open(config.load_checkpoint_path, "rb") as f:
+            checkpoint_data = pickle.load(f)
+        if isinstance(checkpoint_data, dict) and "model" in checkpoint_data:
+            model = checkpoint_data["model"]
+        else:
+            model = checkpoint_data
+        opt_state = optimizer.init(params=model[0])
+
     # replicates to all devices
     model, opt_state = jax.device_put_replicated((model, opt_state), devices)
 
