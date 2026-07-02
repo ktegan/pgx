@@ -898,8 +898,22 @@ def test_observe():
     exp_pts_neg2 = jnp.array([1.0 if x == -2 else 0.0 for x in board_pts], dtype=jnp.float32)
     exp_pts_le_neg3 = jnp.array([1.0 if x <= -3 else 0.0 for x in board_pts], dtype=jnp.float32)
     exp_pts_neg_excess = jnp.maximum(0.0, (-board_pts - 3.0) / 2.0)
-    exp_bar = jnp.abs(board[24:26]) / 2.0
-    exp_off = jnp.abs(board[26:28]) / 15.0  # PLAYER_CHECKERS = 15
+
+    local_features = jnp.stack([
+        exp_pts_1, exp_pts_2, exp_pts_ge3, exp_pts_excess,
+        exp_pts_neg1, exp_pts_neg2, exp_pts_le_neg3, exp_pts_neg_excess,
+    ], axis=-1)
+
+    my_bar = jnp.abs(board[24]) / 2.0
+    opp_bar = jnp.abs(board[25]) / 2.0
+    my_off = jnp.abs(board[26]) / 15.0  # PLAYER_CHECKERS = 15
+    opp_off = jnp.abs(board[27]) / 15.0
+
+    global_vec = jnp.array([my_bar, opp_bar, my_off, opp_off], dtype=jnp.float32)
+    global_features = jnp.tile(global_vec, (24, 1))
+
+    expected_obs = jnp.concatenate([local_features, global_features], axis=-1)
+    expected_obs = jnp.expand_dims(expected_obs, axis=1)
 
     state = make_test_state(
         current_player=jnp.int32(0),
@@ -909,12 +923,6 @@ def test_observe():
         playable_dice=jnp.array([2, 2, 2, -1], dtype=jnp.int32),
         played_dice_num=jnp.int32(1),
     )
-
-    expected_obs = jnp.concatenate([
-        exp_pts_1, exp_pts_2, exp_pts_ge3, exp_pts_excess,
-        exp_pts_neg1, exp_pts_neg2, exp_pts_le_neg3, exp_pts_neg_excess,
-        exp_bar, exp_off
-    ], axis=None)
 
     obs = _make_observation(board)
     assert jnp.allclose(obs, expected_obs)

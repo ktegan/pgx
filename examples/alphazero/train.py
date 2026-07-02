@@ -253,7 +253,7 @@ def train(model, opt_state, data: Sample):
 
 @jax.pmap
 def evaluate(rng_key, my_model):
-    """A simplified evaluation by sampling. Only for debugging. 
+    """A simplified evaluation by sampling. Only for debugging.
     Please use MCTS and run tournaments for serious evaluation."""
     my_player = 0
     my_model_params, my_model_state = my_model

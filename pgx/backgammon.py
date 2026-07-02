@@ -47,8 +47,10 @@ IN_GAME_POSITIONS  = BOARD_LENGTH + BAR_POSITIONS
 ALL_GAME_POSITIONS = IN_GAME_POSITIONS + OFF_POSITIONS
 
 BOARD_ENCODE_ELEM  = 8                  # number of observation elements per board point
-DICE_ENCODE_ELEM   = 2                  # number of observation elements per die side
-OBSERVATION_SIZE   = BOARD_LENGTH * BOARD_ENCODE_ELEM + BAR_POSITIONS + OFF_POSITIONS
+GLOBAL_ENCODE_ELEM = BAR_POSITIONS + OFF_POSITIONS
+CHANNEL_ELEM       = BOARD_ENCODE_ELEM + GLOBAL_ENCODE_ELEM
+OBSERVATION_SHAPE  = (BOARD_LENGTH, 1, CHANNEL_ELEM)  # typically boards are encoded as (height, width, channels) in neural network architectures
+BAR_ENCODE_SCALE   = 2.0    # usually there are two or less checkers on the bar
 
 START_BOARD        = (2, 0, 0, 0, 0, -5, 0, -3, 0, 0, 0, 5, -5, 0, 0, 0, 3, 0, 5, 0, 0, 0, 0, -2)
 START_POSITIONS    = START_BOARD + (0, 0) + (0, 0)
@@ -244,7 +246,7 @@ IN_OPPONENT_HOME_BOARD_MASK = _board_mask_before_src(jnp.int32(HOME_BOARD_LENGTH
 @dataclass
 class State(core.State):
     current_player: Array = jnp.int32(0)
-    observation: Array = jnp.zeros(OBSERVATION_SIZE, dtype=jnp.int32)
+    observation: Array = jnp.zeros(OBSERVATION_SHAPE, dtype=jnp.float32)
     rewards: Array = jnp.float32([0.0] * NUM_PLAYERS)
     terminated: Array = FALSE
     truncated: Array = FALSE
@@ -366,7 +368,7 @@ def _make_observation(board: Array) -> Array:
     will be evaluated on every legal board state.
     """
     board_pts = board[BOARD_RANGE[0]:BOARD_RANGE[1]]
-    observations = [
+    local_features = jnp.stack([
         1.0 * (board_pts == 1),
         1.0 * (board_pts == 2),
         1.0 * (board_pts >= 3),
@@ -375,10 +377,16 @@ def _make_observation(board: Array) -> Array:
         1.0 * (board_pts == -2),
         1.0 * (board_pts <= -3),
         1.0 * jnp.maximum(0.0, ((-board_pts - 3.0) / 2.0)),
-        jnp.abs(board[BAR_RANGE[0]:BAR_RANGE[1]]) / 2.0,
-        jnp.abs(board[OFF_RANGE[0]:OFF_RANGE[1]]) / PLAYER_CHECKERS,
-    ]
-    ret = jnp.concatenate(observations, axis=None)
+    ], axis=-1)
+
+    bar_elem = jnp.abs(board[BAR_RANGE[0]:BAR_RANGE[1]]) / BAR_ENCODE_SCALE
+    off_elem = jnp.abs(board[OFF_RANGE[0]:OFF_RANGE[1]]) / PLAYER_CHECKERS
+    global_vec = jnp.concatenate([bar_elem, off_elem], axis=-1)
+    global_features = jnp.tile(global_vec, (BOARD_LENGTH, 1))
+
+    ret = jnp.concatenate([local_features, global_features], axis=-1)
+    ret = jnp.expand_dims(ret, axis=1)
+    assert ret.shape == OBSERVATION_SHAPE
     return ret
 
 
@@ -403,26 +411,25 @@ def _observe(state: State, _player_id: Array) -> Array:
 
 def _observation_to_board(observation: Array) -> Array:
     """ this returns the board and an array of size 6 which has the playable dice for each die value """
-    BLTH = BOARD_LENGTH
-    BRNG = BOARD_RANGE
-    obs  = observation
+    obs = jnp.squeeze(observation, axis=1)
 
     board_pts = (
-         1 * obs[BLTH * 0 + BRNG[0]:BLTH * 0 + BRNG[1]] +
-         2 * obs[BLTH * 1 + BRNG[0]:BLTH * 1 + BRNG[1]] +
-        jnp.where(obs[BLTH * 2 + BRNG[0]:BLTH * 2 + BRNG[1]] > 0.0,
-                 3 + jax.lax.round(2 * obs[BLTH * 3 + BRNG[0]:BLTH * 3 + BRNG[1]]), 0.0) +
-        -1 * obs[BLTH * 4 + BRNG[0]:BLTH * 4 + BRNG[1]] +
-        -2 * obs[BLTH * 5 + BRNG[0]:BLTH * 5 + BRNG[1]] +
-        jnp.where(obs[BLTH * 6 + BRNG[0]:BLTH * 6 + BRNG[1]] > 0.0,
-                -3 - jax.lax.round(2 * obs[BLTH * 7 + BRNG[0]:BLTH * 7 + BRNG[1]]), 0.0)
+         1 * obs[:, 0] +
+         2 * obs[:, 1] +
+        jnp.where(obs[:, 2] > 0.0, 3 + jax.lax.round(2 * obs[:, 3]), 0.0) +
+        -1 * obs[:, 4] +
+        -2 * obs[:, 5] +
+        jnp.where(obs[:, 6] > 0.0, -3 - jax.lax.round(2 * obs[:, 7]), 0.0)
     )
-    board = jnp.concatenate([board_pts,
-         jax.lax.round(obs[BLTH * 8 + 0] * 2),
-        -jax.lax.round(obs[BLTH * 8 + 1] * 2),
-         jax.lax.round(obs[BLTH * 8 + 2] * PLAYER_CHECKERS),
-        -jax.lax.round(obs[BLTH * 8 + 3] * PLAYER_CHECKERS)
-    ], axis=None)
+    board = jnp.concatenate([
+        board_pts,
+        jnp.array([
+             jax.lax.round(obs[0, 8] * BAR_SCALE),
+            -jax.lax.round(obs[0, 9] * BAR_SCALE),
+             jax.lax.round(obs[0, 10] * PLAYER_CHECKERS),
+            -jax.lax.round(obs[0, 11] * PLAYER_CHECKERS)
+        ])
+    ], axis=None, dtype=BOARD_DTYPE)
     return board
 
 
