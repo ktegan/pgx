@@ -46,25 +46,6 @@ NO_MOVE_SUM        = MAX_MOVES * NO_MOVE
 IN_GAME_POSITIONS  = BOARD_LENGTH + BAR_POSITIONS
 ALL_GAME_POSITIONS = IN_GAME_POSITIONS + OFF_POSITIONS
 
-# Hashing weight vectors for collision-free board deduplication (pseudorandom 32-bit odd integers)
-HASH_WEIGHTS_1 = jnp.array([
-    1099087573, 2147483647, 391583921, 1438902821, 827391823,
-    918273911, 283719283, 192837123, 723192831, 381928371,
-    938102931, 481920391, 102938109, 392810293, 839201923,
-    192830192, 482910293, 928301923, 283910293, 102938192,
-    382910293, 839201928, 482910291, 928301922, 192830191,
-    392810291, 839201921, 283910291
-], dtype=jnp.int32)
-
-HASH_WEIGHTS_2 = jnp.array([
-    1827391823, 93810293, 839201923, 192830192, 482910293,
-    928301923, 283910293, 102938192, 382910293, 839201928,
-    482910291, 928301922, 192830191, 392810291, 839201921,
-    283910291, 1099087573, 2147483647, 391583921, 1438902821,
-    827391823, 918273911, 283719283, 192837123, 723192831,
-    381928371, 938102931, 481920391
-], dtype=jnp.int32)
-
 BOARD_ENCODE_ELEM  = 8                  # number of observation elements per board point
 DICE_ENCODE_ELEM   = 2                  # number of observation elements per die side
 OBSERVATION_SIZE   = BOARD_LENGTH * BOARD_ENCODE_ELEM + BAR_POSITIONS + OFF_POSITIONS
@@ -110,6 +91,25 @@ MADE_POINT_HEURISTIC  = jnp.array([0.2, 0.2, 0.2, 0.4, 0.5, 0.5] + [0.4, 0.3, 0.
 
 ONE_OF_ONE_DICE_HITS  = 1.0 - ((DICE_SIDES - 1) / DICE_SIDES) ** 1   # chance that a single dice is a specific value
 ONE_OF_TWO_DICE_HITS  = 1.0 - ((DICE_SIDES - 1) / DICE_SIDES) ** 2   # chance that either of two dice is a specific value
+
+# Hashing weight vectors for collision-free board deduplication (pseudorandom 32-bit odd integers)
+HASH_WEIGHTS_1 = jnp.array([
+    1099087573, 2147483647, 391583921, 1438902821, 827391823,
+    918273911, 283719283, 192837123, 723192831, 381928371,
+    938102931, 481920391, 102938109, 392810293, 839201923,
+    192830192, 482910293, 928301923, 283910293, 102938192,
+    382910293, 839201928, 482910291, 928301922, 192830191,
+    392810291, 839201921, 283910291
+], dtype=jnp.int32)
+
+HASH_WEIGHTS_2 = jnp.array([
+    1827391823, 93810293, 839201923, 192830192, 482910293,
+    928301923, 283910293, 102938192, 382910293, 839201928,
+    482910291, 928301922, 192830191, 392810291, 839201921,
+    283910291, 1099087573, 2147483647, 391583921, 1438902821,
+    827391823, 918273911, 283719283, 192837123, 723192831,
+    381928371, 938102931, 481920391
+], dtype=jnp.int32)
 
 
 def _action_is_noop(action):
@@ -237,10 +237,8 @@ SRC_BOARD_MASK_PER_DIE = jnp.transpose(ACTION_SRC_BOARD_MASK.reshape(SRC_LENGTH,
 SRC_ANY_DIE = SRC_PER_DIE[0]
 SRC_BOARD_MASK_ANY_DIE = SRC_BOARD_MASK_PER_DIE[0]
 
-
-
-
 OUTSIDE_HOME_BOARD_MASK = _board_mask_before_src(jnp.int32(BOARD_LENGTH - HOME_BOARD_LENGTH))
+IN_OPPONENT_HOME_BOARD_MASK = _board_mask_before_src(jnp.int32(HOME_BOARD_LENGTH))
 
 
 @dataclass
@@ -592,7 +590,7 @@ def _arr_is_any_earlier(black_checker_mask: Array, src: Array, src_board_mask: A
     This checks if there are any black checkers before the src position of the relevant action
     (important when bearing off).
     """
-    if src.ndim == 0:
+    if src.ndim == 0 and src_board_mask is None:
         return (black_checker_mask & _board_mask_before_src(src)).any(axis=-1)
 
     if src_board_mask is None:
@@ -600,7 +598,18 @@ def _arr_is_any_earlier(black_checker_mask: Array, src: Array, src_board_mask: A
     return (black_checker_mask.astype(MAT_MULT_DTYPE) @ src_board_mask.T) > 0
 
 
+def _arr_is_all_on_home_board(board: Array) -> Array:
+    black_checker_mask = board > 0
+    return (black_checker_mask.astype(MAT_MULT_DTYPE) @ OUTSIDE_HOME_BOARD_MASK) == 0
+
+
+def _arr_is_any_on_opponent_home_board(board: Array) -> Array:
+    black_checker_mask = board > 0
+    return (black_checker_mask.astype(MAT_MULT_DTYPE) @ IN_OPPONENT_HOME_BOARD_MASK) > 0
+
+
 def _arr_is_illegal_on_board(board_arr, diff):
+    assert board_arr.ndim in (1, 2), f'board must be a single board or a batch of boards, shape {board_arr.shape}'
     assert board_arr.shape[-1] == ALL_GAME_POSITIONS, f"Expected last dimension of board_arr to be {ALL_GAME_POSITIONS}, got {board_arr.shape}"
 
     diff_pos = (diff > 0).astype(MAT_MULT_DTYPE)
@@ -613,7 +622,7 @@ def _arr_is_illegal_on_board(board_arr, diff):
 def _arr_is_illegal_off(black_checker_mask, src, tgt, die, src_board_mask: Array = None):
     is_off              = (tgt == OFF_IDX)
     is_any_earlier      = _arr_is_any_earlier(black_checker_mask, src, src_board_mask)
-    is_all_home         = (black_checker_mask.astype(MAT_MULT_DTYPE) @ OUTSIDE_HOME_BOARD_MASK) == 0
+    is_all_home         = _arr_is_all_on_home_board(black_checker_mask)
     is_exact_off        = (BOARD_LENGTH - src) == die
     return is_off & ((~is_all_home)[..., jnp.newaxis] | ((~is_exact_off) & is_any_earlier))
 
@@ -623,6 +632,9 @@ def _arr_is_move_legal(board_arr: Array, diff: Array, src: Array, die: Array, tg
     Apply board diffs to board_arr. Wherever diff is positive and board_arr has -1,
     the board_arr value is treated as 0 (simulating hit/blot removal).
     """
+    assert board_arr.ndim in (1, 2), f'board must be a single board or a batch of boards, shape {board_arr.shape}'
+    assert board_arr.shape[-1] == ALL_GAME_POSITIONS, f'board last dimension must be {ALL_GAME_POSITIONS}, shape {board_arr.shape}'
+
     is_illegal_on_board = _arr_is_illegal_on_board(board_arr, diff)
     black_checker_mask  = _arr_black_checker_mask(board_arr)
     is_illegal_off      = _arr_is_illegal_off(black_checker_mask, src, tgt, die, src_board_mask)
@@ -634,14 +646,24 @@ def _arr_is_move_legal(board_arr: Array, diff: Array, src: Array, die: Array, tg
     return ~is_illegal
 
 
+def _arr_is_action_legal(board_arr: Array, action:Array) -> Array:
+    """ this is the slower way of doing things, use _arr_is_move_legal directly with precomputed diff values """
+    src, die, tgt   = _decompose_action(action)
+    diff = jnp.zeros(src.shape + (ALL_GAME_POSITIONS,), dtype=BOARD_DTYPE).at[src].set(-1).at[tgt].set(1)
+    return _arr_is_move_legal(board_arr, diff, src, die, tgt)
+
+
 def _deduplicate_boards(boards: Array, legal: Array, first_move: Array, limit: int) -> Tuple[Array, Array, Array]:
     """
     Deduplicates a set of board states of shape (N, 28) with legality mask (N,),
     returning exactly `limit` unique legal boards of shape (limit, 28), unique_legal mask (limit,),
-    and unique_first_move indices (limit,).
+    and unique_first_move indices (limit,).  We use ~legal as the primary key when sorting (last in
+    the tuple) so that legal boards (0) sort before illegal ones.
     """
+    assert boards.ndim in (1, 2), f'board must be a single board or a batch of boards, shape {boards.shape}'
+    assert boards.shape[-1] == ALL_GAME_POSITIONS, f'board last dimension must be {ALL_GAME_POSITIONS}, shape {boards.shape}'
+
     # Sort lexicographically using 2 independent random 32-bit projection hashes.
-    # We use ~legal as the primary key (last in the tuple) so that legal boards (0) sort before illegal ones (1).
     hash1 = (boards.astype(jnp.int32) * HASH_WEIGHTS_1).sum(axis=-1)
     hash2 = (boards.astype(jnp.int32) * HASH_WEIGHTS_2).sum(axis=-1)
     sort_keys = (hash1, hash2, (~legal).astype(jnp.int32))
@@ -672,8 +694,19 @@ def _deduplicate_boards(boards: Array, legal: Array, first_move: Array, limit: i
 
 
 def _arr_make_new_boards(board: Array, diffs: Array) -> Array:
+    """
+    The diffs array is an array with a -1 where a black checker is leaving (src) and
+    a +1 where the black checker is landing (tgt).  When a checker is bearing off
+    the tgt will be OFF_IDX.  This updates the white checker bar count (BAR_IDX + 1)
+    if the black checker hits a single white checker.
+
+    Note that this method is called with a variety of board dimensions, such as
+    _evaluate_2ply_details which calls this with board shape (13, 1, 10, 28)
+    """
+    assert board.shape[-1] == ALL_GAME_POSITIONS, f'board last dimension must be {ALL_GAME_POSITIONS}, shape {board.shape}'
+
     hit_tgt = (diffs > 0) & (board == -1)
-    new_boards = jnp.where(hit_tgt, BOARD_DTYPE(1), board + diffs)
+    new_boards = jnp.where(hit_tgt, BOARD_DTYPE(1), board + diffs)   # if we don't do this the black checker (+1) and hit white checker (-1) will sum to 0
 
     # Vectorized update of the white bar count (index BAR_IDX + 1) for each candidate board
     hits_per_candidate = hit_tgt.sum(axis=-1).astype(BOARD_DTYPE)
@@ -683,6 +716,9 @@ def _arr_make_new_boards(board: Array, diffs: Array) -> Array:
 
 
 def _arr_step_one_move_dice_actions(board: Array, die_idx: int) -> Tuple[Array, Array]:
+    assert board.ndim in (1, 2), f'board must be a single board or a batch of boards, shape {board.shape}'
+    assert board.shape[-1] == ALL_GAME_POSITIONS, f'board last dimension must be {ALL_GAME_POSITIONS}, shape {board.shape}'
+
     diffs = BOARD_DIFFS_PER_DIE[die_idx]
     tgt = TGT_PER_DIE[die_idx]
     src = SRC_ANY_DIE
@@ -695,6 +731,16 @@ def _arr_step_one_move_dice_actions(board: Array, die_idx: int) -> Tuple[Array, 
 
 
 def _arr_one_and_two_moves(board, sorted_dice):
+    """
+    For every action that could be taken by either die (52 actions total) this computes
+    if the action is legal and what the board would look like.  This also computes whether
+    the action of the remaining die would be legal.  This does not create the boards for
+    all of the 52 x 52 two action possibilities, but the action indices, tgt and diffs
+    returned can be used to compute those boards if you want them.
+    """
+    assert board.ndim in (1, 2), f'board must be a single board or a batch of boards, shape {board.shape}'
+    assert board.shape[-1] == ALL_GAME_POSITIONS, f'board last dimension must be {ALL_GAME_POSITIONS}, shape {board.shape}'
+
     die1_idx = jnp.clip(sorted_dice[-1], 1, 6) - 1
     die2_idx = jnp.clip(sorted_dice[-2], 1, 6) - 1
 
@@ -723,10 +769,25 @@ def _arr_one_and_two_moves(board, sorted_dice):
 
 def _arr_legal_action_mask_details(board: Array, playable_dice: Array):
     """
-    I have not proven mathematically but I believe that for double rolls it is
-    sufficient to look two moves ahead.  The "must use the larger die" and
-    other subtleties do not come up when every move has the same dice value.
+    Compute which 1- and 2-dice moves are legal from the given board.  This handles
+    the somewhat subtle backgammon movement rules.
+
+    Backgammon movement rules from bkgm.com: A player must use both numbers of a roll if
+       this is legally possible (or all four numbers of a double). When only one number can
+       be played, the player must play that number. Or if either number can be played but not
+       both, the player must play the larger one. When neither number can be used, the player
+       loses his turn.  In the case of doubles, when all four numbers cannot be played, the
+       player must play as many numbers as he can.
+
+    When doubles are rolled all moves use the same die value and the logic is much simpler.
+    Unlike the case with two different die values any move that looks valid as a first move
+    is valid, you don't need to consider later board states (admittedly I don't have a proof
+    for this).  Because of this we do not need to consider possible third or fourth moves
+    when defining which actions are legal for the next move.
     """
+    assert board.ndim in (1, 2), f'board must be a single board or a batch of boards, shape {board.shape}'
+    assert board.shape[-1] == ALL_GAME_POSITIONS, f'board last dimension must be {ALL_GAME_POSITIONS}, shape {board.shape}'
+
     sorted_dice = jnp.sort(jnp.where(playable_dice == NO_MOVE, NO_MOVE - 1, playable_dice + 1))
 
     one_move_legal_per_die, one_move_boards_per_die, two_move_legal_raw_per_die, candidate_action_indices, candidate_tgt, candidate_diffs = \
@@ -769,97 +830,13 @@ def _arr_legal_action_mask(board: Array, playable_dice: Array) -> Array:
     return jnp.where(legal_moves.any(), legal_moves_padded, NOOP_ACTION_MASK)
 
 
-def _home_board() -> Array:
+def _get_abs_board(state: State) -> Array:
     """
-    black: [18~23], white: [0~5]: Always black's perspective
+    For visualization.
     """
-    return jnp.arange(BOARD_LENGTH - HOME_BOARD_LENGTH, BOARD_LENGTH, dtype=BOARD_DTYPE)  # type: ignore
-
-
-def _rear_distance(board: Array) -> Array:
-    """
-    The distance from the farthest checker to the goal: Always black's perspective
-    """
-    b = board[:BOARD_LENGTH]
-    exists = jnp.where((b > 0), size=BOARD_LENGTH, fill_value=jnp.nan)[0]  # type: ignore
-    return BOARD_LENGTH - jnp.min(jnp.nan_to_num(exists, nan=jnp.int32(BOARD_LENGTH + 1)))
-
-
-def _is_all_on_home_board(board: Array):
-    """
-    One can bear off if all checkers are on home board.
-    """
-    home_board: Array = _home_board()
-    on_home_board = jnp.minimum(jnp.maximum(board[home_board], 0), PLAYER_CHECKERS).sum()
-    off = board[OFF_IDX]  # type: ignore
-    return (PLAYER_CHECKERS - off) == on_home_board
-
-
-def _is_open(board: Array, point: int) -> bool:
-    """
-    Check if the point is open for the current player: Always black's perspective
-    One can move to the point if there is no more than one opponent's checker.
-    """
-    checkers = board[point]
-    return checkers >= -1  # type: ignore
-
-
-def _exists(board: Array, point: int) -> bool:
-    """
-    Check if the point has the current player's checker: Always black's perspective
-    """
-    checkers = board[point]
-    return checkers >= 1  # type: ignore
-
-
-
-
-
-def _is_action_legal(board: Array, action: Array) -> bool:
-    """
-    Check if the action is legal.  Noop (negative src) is not considered legal in this function.
-    action = src * 6 + die
-    src = [no op., from bar, 0, .., 23]
-    """
-    src, die, tgt   = _decompose_action(action)
-    is_regular_move = (src >= 0) & (src <= BAR_IDX)   # not noop or chance action
-    _is_to_point    = (tgt < BOARD_LENGTH)
-    return is_regular_move & jnp.where(_is_to_point, _is_to_point_legal(board, src, tgt),
-                                                     _is_to_off_legal(board, src, tgt, die))  # type: ignore
-
-
-def _distance_to_goal(src: int) -> int:
-    """
-    The distance from the src to the goal: Always black's perspective
-    """
-    return BOARD_LENGTH - src  # type: ignore
-
-
-def _is_to_off_legal(board: Array, src: int, tgt: int, die: int):
-    """
-    Check if the action is legal when the target is off.
-    The conditions are:
-    1. src has checkers.
-    2. All checkers are on home board.
-    3. The distance from the src to the goal is the same as the die or the src is the farthest checker and the die is bigger than the distance.
-    """
-    r = _rear_distance(board)
-    d = _distance_to_goal(src)
-    is_regular_move = (src >= 0) & (src <= BAR_IDX)   # not noop or chance action
-    return (
-        is_regular_move & _exists(board, src) & _is_all_on_home_board(board) & ((d == die) | ((r <= die) & (r == d)))
-    )  # type: ignore
-
-
-def _is_to_point_legal(board: Array, src: int, tgt: int) -> bool:
-    """
-    Check if the action is legal when the target is point.
-    """
-    e = _exists(board, src)
-    o = _is_open(board, tgt)
-    nothing_on_bar = (board[BAR_IDX] == 0)
-    is_regular_move = (src >= 0) & (src <= BAR_IDX)   # not noop or chance action
-    return e & o & is_regular_move & ((src == BAR_IDX) | nothing_on_bar)
+    board: Array = state._board
+    turn: Array = state._turn
+    return jax.lax.cond(turn == 0, lambda: board, lambda: _flip_board(board))
 
 
 def _move(board: Array, action: Array) -> Array:
@@ -889,7 +866,7 @@ def _calc_win_score(board: Array) -> int:
     Backgammon win: 3 points
     """
     g = _is_gammon(board)
-    return 1 + g + (g & _remains_at_inner(board))
+    return 1 + g + (g & _arr_is_any_on_opponent_home_board(_flip_board(board)))
 
 
 def _is_gammon(board: Array) -> bool:
@@ -897,100 +874,6 @@ def _is_gammon(board: Array) -> bool:
     If there is no opponent's checker on off, the player wins gammon.
     """
     return board[OFF_IDX + 1] == 0  # type: ignore
-
-
-def _remains_at_inner(board: Array) -> bool:
-    """
-    (1) If there is no opponent's checker on off and (2) there is at least one opponent's checker on inner, the player wins backgammon.
-    """
-    return jnp.take(board, _home_board()).sum() != 0  # type: ignore
-
-
-def _can_use_other_die(action_die_pair, is_selected, board, playable_dice):
-    first_action, last_die = action_die_pair
-
-    def handle_action():
-        new_board = _move(board, first_action)
-        other_playable_dice = jnp.where(playable_dice == last_die, NO_MOVE, playable_dice)
-        next_legal_actions = jax.vmap(partial(_legal_action_mask_for_single_die, board=new_board))(die=other_playable_dice) # return 2D (SRC_LENGTH, DICE_SIDES) array
-        return next_legal_actions.any()
-
-    return jax.lax.cond(is_selected & (last_die != NO_MOVE), handle_action, lambda: FALSE)
-
-
-def _legal_action_mask(board: Array, playable_dice: Array) -> Array:
-    start_idx = SRC_NO_MOVE * DICE_SIDES
-    no_op_mask = jnp.zeros(ACTION_TOTAL_LENGTH, dtype=jnp.bool_).at[start_idx:start_idx + DICE_SIDES].set(TRUE)
-    legal_actions = jax.vmap(partial(_legal_action_mask_for_single_die, board=board))(die=playable_dice) # return 2D (SRC_LENGTH, DICE_SIDES) array
-    dice_has_valid_first_moves = legal_actions.any(axis=1)
-
-    # Backgammon movement rules from bkgm.com: A player must use both numbers of a roll if
-    #   this is legally possible (or all four numbers of a double). When only one number can
-    #   be played, the player must play that number. Or if either number can be played but not
-    #   both, the player must play the larger one. When neither number can be used, the player
-    #   loses his turn.  In the case of doubles, when all four numbers cannot be played, the
-    #   player must play as many numbers as he can.
-
-    # Compute which moves can lead to subsequent second moves
-    flat_array_shape = ACTION_TOTAL_LENGTH * MAX_MOVES
-    flat_actions = jnp.tile(jnp.arange(ACTION_TOTAL_LENGTH), (MAX_MOVES, 1)).reshape(flat_array_shape)
-    flat_last_die = jnp.tile(playable_dice[..., jnp.newaxis], (1, ACTION_TOTAL_LENGTH)).reshape(flat_array_shape)
-    flat_legal_moves = legal_actions.reshape(flat_array_shape)
-    selection_indices, results = chunked_map(_can_use_other_die, (flat_actions, flat_last_die), flat_legal_moves,
-                                             func_kwargs={'board': board, 'playable_dice': playable_dice}, func_uses_is_selected=True)
-    action_has_valid_second_moves = jnp.zeros(flat_array_shape, dtype=jnp.bool_)
-
-    action_has_valid_second_moves = action_has_valid_second_moves.at[selection_indices].set(results)
-    action_has_valid_second_moves = action_has_valid_second_moves.reshape((MAX_MOVES, ACTION_TOTAL_LENGTH))
-
-    any_valid_second_moves = action_has_valid_second_moves.any()
-    two_move_actions = legal_actions & action_has_valid_second_moves
-    two_move_actions = two_move_actions.any(axis=0)   # if an action works for any playable dice it is legal
-
-    # We must use the largest roll if no second moves are available
-    playable_dice_with_one_move = jnp.where(dice_has_valid_first_moves, playable_dice, NO_MOVE)
-    largest_die_with_one_move = jnp.max(playable_dice_with_one_move)  # a playable die will always be greater than NO_MOVE which is negative
-    one_move_actions = legal_actions & (playable_dice == largest_die_with_one_move)[..., jnp.newaxis]
-    one_move_actions = one_move_actions.any(axis=0)
-
-    out = jnp.where(legal_actions.any(),
-                    jnp.where(any_valid_second_moves, two_move_actions, one_move_actions),
-                    no_op_mask)
-    return out
-
-
-def _legal_action_mask_for_single_die(board: Array, die: int) -> Array:
-    """
-    Legal action mask for a single die.
-    """
-    return jnp.where(die == NO_MOVE, jnp.zeros(ACTION_TOTAL_LENGTH, dtype=jnp.bool_),
-                                     _legal_action_mask_for_valid_single_dice(board, die))
-
-
-def _legal_action_mask_for_valid_single_dice(board: Array, die: int) -> Array:
-    """
-    Legal action mask for a single die when the die is valid.
-    """
-    action_src_indices = jnp.arange(SRC_LENGTH, dtype=jnp.int32)  # calc legal action for all src indices
-
-    def _is_legal(idx: Array):
-        action = idx * DICE_SIDES + die
-        legal_action_mask = jnp.zeros(ACTION_TOTAL_LENGTH, dtype=jnp.bool_)
-        legal_action_mask = legal_action_mask.at[action].set(_is_action_legal(board, action))
-        return legal_action_mask
-
-    legal_action_mask = jax.vmap(_is_legal)(action_src_indices).any(axis=0)  # map over ACTION_LENGTH elements
-    return legal_action_mask
-
-
-def _get_abs_board(state: State) -> Array:
-    """
-    For visualization.
-    """
-    board: Array = state._board
-    turn: Array = state._turn
-    return jax.lax.cond(turn == 0, lambda: board, lambda: _flip_board(board))
-
 
 
 def max_non_zero_idx_or_fallback(arr: Array, fallback: Array):
@@ -1330,10 +1213,10 @@ class BackgammonFullTurnStrategy(core.Strategy):
     COMBINATIONS_3_MOVES = 3120
     COMBINATIONS_4_MOVES = 17680
 
-    CHUNK_SIZE_3_MOVES = 20
-    NUM_CHUNKS_3_MOVES = 34
-    CHUNK_SIZE_4_MOVES = 30
-    NUM_CHUNKS_4_MOVES = 102
+    CHUNK_SIZE_3_MOVES = 10
+    NUM_CHUNKS_3_MOVES = 68
+    CHUNK_SIZE_4_MOVES = 10
+    NUM_CHUNKS_4_MOVES = 306
 
     def __init__(self, env):
         self.env = env

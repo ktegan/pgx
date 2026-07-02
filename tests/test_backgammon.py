@@ -27,18 +27,16 @@ from pgx.backgammon import (
     _calc_tgt,
     _calc_win_score,
     _change_turn,
-    _is_action_legal,
-    _is_all_on_home_board,
+    _arr_is_all_on_home_board,
+    _arr_is_any_on_opponent_home_board,
+    _arr_is_any_earlier,
     _arr_is_move_legal,
+    _arr_is_action_legal,
     _arr_one_and_two_moves,
-    _is_open,
     _move,
-    _rear_distance,
     _roll_init_dice,
-    _distance_to_goal,
     _is_turn_end,
     _no_winning_step,
-    _exists,
     _set_playable_dice,
     _board_mask_before_src,
     _arr_legal_action_mask,
@@ -68,14 +66,13 @@ _action_to_src = jax.jit(_action_to_src)
 _calc_tgt = jax.jit(_calc_tgt)
 _calc_win_score = jax.jit(_calc_win_score)
 _change_turn = jax.jit(_change_turn)
-_is_action_legal = jax.jit(_is_action_legal)
-_is_all_on_home_board = jax.jit(_is_all_on_home_board)
+_arr_is_all_on_home_board = jax.jit(_arr_is_all_on_home_board)
+_arr_is_any_on_opponent_home_board = jax.jit(_arr_is_any_on_opponent_home_board)
+_arr_is_any_earlier = jax.jit(_arr_is_any_earlier)
 _arr_is_move_legal = jax.jit(_arr_is_move_legal)
+_arr_is_action_legal = jax.jit(_arr_is_action_legal)
 _arr_one_and_two_moves = jax.jit(_arr_one_and_two_moves)
-_is_open = jax.jit(_is_open)
 _move = jax.jit(_move)
-_rear_distance = jax.jit(_rear_distance)
-_exists = jax.jit(_exists)
 _set_playable_dice = jax.jit(_set_playable_dice)
 _board_mask_before_src = jax.jit(_board_mask_before_src)
 _arr_legal_action_mask = jax.jit(_arr_legal_action_mask)
@@ -1116,62 +1113,26 @@ def test_largest_blocking_prime():
     assert opp_prime[0] == 2
 
 
-def test_is_open():
-    board = make_test_board()
-    # Black
-    assert _is_open(board, 9)
-    assert _is_open(board, 19)
-    assert _is_open(board, 4)
-    assert not _is_open(board, 10)
-    # White
-    board = _flip_board(board)
-    assert _is_open(board, 9)
-    assert _is_open(board, 8)
-    assert not _is_open(board, 2)
-    assert not _is_open(board, 4)
-
-
-def test_exists():
-    board = make_test_board()
-    # Black
-    assert _exists(board, 19)
-    assert _exists(board, 20)
-    assert not _exists(board, 4)
-    # White
-    board = _flip_board(board)
-    assert _exists(board, 19)
-    assert _exists(board, 20)
-    assert not _exists(board, 2)
-
-
 def test_is_all_on_home_board():
     board: jnp.ndarray = make_test_board()
     # Black
-    assert _is_all_on_home_board(board)
+    assert _arr_is_all_on_home_board(board)
     # White
     board = _flip_board(board)
-    assert not _is_all_on_home_board(board)
+    assert not _arr_is_all_on_home_board(board)
+
+    board = jnp.zeros(28, dtype=BOARD_DTYPE).at[26].set(13)
+    assert not _arr_is_all_on_home_board(board.at[17].set(1))
+    assert     _arr_is_all_on_home_board(board.at[18].set(1))
+    assert not _arr_is_all_on_home_board(board.at[18].set(1).at[24].set(2))
 
 
-def test_rear_distance():
-    board = make_test_board()
-    turn = jnp.int32(-1)
-    # Black
-    assert _rear_distance(board) == 5
-    # White
-    board = _flip_board(board)
-    assert _rear_distance(board) == 23
+def test_is_any_on_opponent_home_board():
+    board = jnp.zeros(28, dtype=BOARD_DTYPE).at[26].set(13)
+    assert     _arr_is_any_on_opponent_home_board(board.at[5].set(1))
+    assert not _arr_is_any_on_opponent_home_board(board.at[6].set(1))
+    assert     _arr_is_any_on_opponent_home_board(board.at[5].set(1).at[24].set(2))
 
-
-def test_distance_to_goal():
-    board = make_test_board()
-    # Black
-    src = 23
-    assert _distance_to_goal(src) == 1
-    src = 10
-    assert _distance_to_goal(src) == 14
-    # Teat at the src where rear_distance is same
-    assert _rear_distance(board) == _distance_to_goal(19)
 
 
 def test_action_to_src():
@@ -1189,25 +1150,25 @@ def test_calc_tgt():
 def test_is_action_legal():
     board: jnp.ndarray = make_test_board()
     # 黒
-    assert _is_action_legal(board, (19 + 2) * 6 + 1)  # 19->21
-    assert not _is_action_legal(board, (19 + 2) * 6 + 2)  # 19 -> 22
-    assert not _is_action_legal(
+    assert _arr_is_action_legal(board, (19 + 2) * 6 + 1)  # 19->21
+    assert not _arr_is_action_legal(board, (19 + 2) * 6 + 2)  # 19 -> 22
+    assert not _arr_is_action_legal(
         board, (19 + 2) * 6 + 2
     )  # 19 -> 22: Some whites on 22
-    assert not _is_action_legal(
+    assert not _arr_is_action_legal(
         board, (22 + 2) * 6 + 2
     )  # 22 -> 25: No black on 22
-    assert _is_action_legal(board, (19 + 2) * 6 + 5)  # bear off
-    assert not _is_action_legal(
+    assert _arr_is_action_legal(board, (19 + 2) * 6 + 5)  # bear off
+    assert not _arr_is_action_legal(
         board, (20 + 2) * 6 + 5
     )  # cannot bear off as some blacks behind
     # white
     board = _flip_board(board)
-    assert not _is_action_legal(
+    assert not _arr_is_action_legal(
         board, (20 + 2) * 6 + 0
     )  # 20->21(after flipped): cannot move checkers as some left on bar
-    assert _is_action_legal(board, (1) * 6 + 0)  # bar -> 1(after flipped)
-    assert not _is_action_legal(board, (1) * 6 + 2)  # bar -> 2(after flipped)
+    assert _arr_is_action_legal(board, (1) * 6 + 0)  # bar -> 0(after flipped)
+    assert not _arr_is_action_legal(board, (1) * 6 + 2)  # bar -> 2(after flipped)
 
 
 def test_move():

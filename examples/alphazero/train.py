@@ -48,7 +48,7 @@ class Config(BaseModel):
     max_num_iters: int = 400
     # network params
     num_channels: int = 256   # aka filters
-    num_layers: int = 12       # aka residual blocks
+    num_layers: int = 12      # aka residual blocks
     resnet_v2: bool = True
     # selfplay params
     selfplay_batch_size: int = 1024
