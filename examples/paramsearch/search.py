@@ -96,16 +96,16 @@ def compute_match_score(rewards, init_player):
 
 
 
-@jax.jit(static_argnames=('batch_size', 'env_id', 'model_cls', 'strategy'))
-def play_games_jax(batch_size, env_id, model_cls, rng_key, model_params, p0_indices, p1_indices, strategy):
+@jax.jit(static_argnames=('batch_size', 'env_id', 'evaluator_cls', 'strategy'))
+def play_games_jax(batch_size, env_id, rng_key, evaluator_cls, eval_params, p0_indices, p1_indices, strategy):
     """ this runs one set of batch_size games in parallel """
     env = pgx.make(env_id)
     num_matchups = p0_indices.shape[0]
     games_per_matchup = batch_size // num_matchups
     batch_size = num_matchups * games_per_matchup   # to ensure divisibility
 
-    param_0_matchups = jax.tree_util.tree_map(lambda x: x[p0_indices], model_params)
-    param_1_matchups = jax.tree_util.tree_map(lambda x: x[p1_indices], model_params)
+    param_0_matchups = jax.tree_util.tree_map(lambda x: x[p0_indices], eval_params)
+    param_1_matchups = jax.tree_util.tree_map(lambda x: x[p1_indices], eval_params)
 
     params_0 = jax.tree_util.tree_map(
         lambda x: jnp.repeat(x[:, jnp.newaxis, ...], games_per_matchup, axis=1).reshape((-1,) + x.shape[1:]),
@@ -138,7 +138,7 @@ def play_games_jax(batch_size, env_id, model_cls, rng_key, model_params, p0_indi
         key, key1, key2 = jax.random.split(key, 3)
         chance_action = jax.random.categorical(key1, chance_logits, axis=-1)
 
-        move_action = strategy.get_next_action_batch(state, key2, active_params, model_cls)
+        move_action = strategy.get_next_action_batch(state, key2, active_params, evaluator_cls)
         action = jnp.where(is_chance_node, chance_action, move_action)
 
         key, step_rng = jax.random.split(key)
@@ -182,13 +182,11 @@ def mutate_config(config, rng_key, abs_stddev, rel_stddev, mutate_field_prob=1.0
     return type(config)(**new_fields), keys[-1]
 
 
-def run_tournament(env_id:str, model_cls:pgx.core.Base, config: TrainConfig, strategy_factory=None, candidate_config_lst=None):
+def run_tournament(env_id:str, config: TrainConfig, strategy_factory, evaluator_cls:pgx.core.Evaluator, candidate_config_lst=None):
 
     rng_key = jax.random.PRNGKey(config.initial_rng_key)
     env = pgx.make(env_id)
-    default_config = model_cls.get_default_config()
-    if strategy_factory is None:
-        strategy_factory = lambda env: OnePlyStrategy(env)
+    default_config = evaluator_cls.get_default_config()
     strategy = strategy_factory(env)
 
     if candidate_config_lst is None:
@@ -255,7 +253,7 @@ def run_tournament(env_id:str, model_cls:pgx.core.Base, config: TrainConfig, str
         while True:
             b_idx += 1
             rng_key, subkey = jax.random.split(rng_key)
-            batch_scores, batch_var = play_games_jax(config.batch_size, env_id, model_cls, subkey, pool_configs_batched, p0_indices, p1_indices, strategy)
+            batch_scores, batch_var = play_games_jax(config.batch_size, env_id, subkey, evaluator_cls, pool_configs_batched, p0_indices, p1_indices, strategy)
             match_scores = match_scores + batch_scores
             var_rewards_accum = var_rewards_accum + batch_var
 
@@ -464,13 +462,13 @@ def get_current_distributions(default_config, mutate_parameters, freeze_paramete
     return distributions
 
 
-def optuna_param_search(env_id: str, model_cls: pgx.core.Base, search_config: OptunaConfig, initial_params=None, strategy_factory: Optional[Callable]=None):
+def optuna_param_search(env_id: str, search_config: OptunaConfig, evaluator_cls: pgx.core.Evaluator, initial_params=None, strategy_factory: Optional[Callable]=None):
     """
     This runs a sequence of optuna trials which we call generations to search for an optimal
-    set of model parameters.  In each generation we use the optuna CMA-ES sampler to come
-    up with new candidate model parameters based on the observed performance (and pair-wise
-    interaction) of past models.  Then we evalaute the new models relative to a pool of
-    previous champion models that showed the best performance in previous generations.
+    set of evaluator parameters.  In each generation we use the optuna CMA-ES sampler to come
+    up with new candidate evaluator parameters based on the observed performance (and pair-wise
+    interaction) of past evaluators.  Then we evalaute the new evaluators relative to a pool of
+    previous champion evaluators that showed the best performance in previous generations.
     """
     rng_key = jax.random.PRNGKey(search_config.initial_rng_key)
     env = pgx.make(env_id)
@@ -479,7 +477,7 @@ def optuna_param_search(env_id: str, model_cls: pgx.core.Base, search_config: Op
     strategy = strategy_factory(env)
 
     if initial_params is None:
-        initial_params = model_cls.get_default_config()
+        initial_params = evaluator_cls.get_default_config()
 
     champion_pool = [initial_params]
 
@@ -549,7 +547,7 @@ def optuna_param_search(env_id: str, model_cls: pgx.core.Base, search_config: Op
 
                 # run one batch of games for the current candidate against the pool of champions
                 batch_scores, running_var = play_games_jax(
-                    search_config.batch_size, env_id, model_cls, subkey, pool_configs_batched, p0_indices, p1_indices, strategy
+                    search_config.batch_size, env_id, subkey, evaluator_cls, pool_configs_batched, p0_indices, p1_indices, strategy
                 )
 
                 # batch score is average score within the batch

@@ -55,7 +55,7 @@ def main_manual():
         #strategy_factory = lambda env: BackgammonFullTurnStrategy(env)
 
         print(f'STARTING FOR {field=}')
-        run_tournament('backgammon', SimpleBackgammonEvaluator, config, strategy_factory=strategy_factory, candidate_config_lst=config_lst)
+        run_tournament('backgammon', config, strategy_factory=strategy_factory, evaluator_cls=SimpleBackgammonEvaluator, candidate_config_lst=config_lst)
         print(f'ENDING FOR {field=}')
 
 
@@ -64,7 +64,7 @@ def main_optuna():
     initial_params = SimpleBackgammonEvaluatorConfig()
     #strategy = OnePlyStrategy(env)
     strategy_factory = lambda env: BackgammonTwoPlyStrategy(env)
-    optuna_param_search('backgammon', SimpleBackgammonEvaluator, search_config, strategy_factory=strategy_factory, initial_params=initial_params)
+    optuna_param_search('backgammon', search_config, strategy_factory=strategy_factory, evaluator_cls=SimpleBackgammonEvaluator, initial_params=initial_params)
 
 if __name__ == "__main__":
     main_manual()

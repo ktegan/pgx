@@ -19,6 +19,7 @@ from pgx.backgammon import (
     Backgammon,
     SimpleBackgammonEvaluator,
     BackgammonTwoPlyStrategy,
+    BackgammonTwoPlyChunkedStrategy,
     BackgammonFullTurnStrategy,
     _decompose_action,
     _to_playable_dice_count,
@@ -51,6 +52,7 @@ from pgx.backgammon import (
     _largest_blocking_prime,
     _get_backmost_black_checker_pos,
     _get_backmost_white_checker_pos,
+    _is_no_contact,
 )
 
 seed = 1701
@@ -960,7 +962,7 @@ def test_estimate_batch_equity():
     )
     obs = observe(state)
 
-    predictor = SimpleBackgammonEvaluator(SimpleBackgammonEvaluator.get_default_config())
+    predictor = SimpleBackgammonEvaluator()
     batched_state = jax.tree_util.tree_map(lambda x: x[jnp.newaxis, ...], state)
     equity_new = predictor.eval(batched_state)
     assert equity_new.shape == (1,)
@@ -1691,7 +1693,7 @@ def test_strategy_obvious_moves():
     all_tests = starting_move_tests + hit_and_make_home_point_tests + one_move_tests + no_move_tests
     all_boards = jnp.concatenate([test.board for test in all_tests])
 
-    strategy_lst = [BackgammonTwoPlyStrategy(env), BackgammonFullTurnStrategy(env)]
+    strategy_lst = [BackgammonTwoPlyStrategy(env), BackgammonTwoPlyChunkedStrategy(env), BackgammonFullTurnStrategy(env)]
     for strategy in strategy_lst:
         for cur_test in all_tests:
             _run_strategy_test(strategy, cur_test)
@@ -1701,10 +1703,10 @@ def test_strategy_full_move():
     class UnitTestEvaluator(pgx.core.Evaluator):
         @classmethod
         def get_default_config(cls):
-            return SimpleBackgammonEvaluator.get_default_config()
+            return SimpleBackgammonEvaluator.get_default_config()   # return a dummy config
 
         def __init__(self, config):
-            pass
+            super().__init__(config)
 
         def eval(self, state: State) -> Array:
             # create a reward that would require looking 4 moves ahead to discover,
@@ -1862,3 +1864,76 @@ def test_checkers_behind_prime():
     assert opp_prime[0] == 2
     assert my_checkers_behind[0] == 4  # 2 at 22 + 1 at 21 + 1 on bar
     assert opp_checkers_behind[0] == 7  # 3 at 5 + 2 at 7 + 2 on bar
+
+
+def test_is_no_contact():
+    # Case 1: Standard starting board (definitely contact is possible)
+    board_start = jnp.array(START_POSITIONS, dtype=BOARD_DTYPE)
+    assert not _is_no_contact(board_start)
+
+    # Case 2: Contact is still possible (e.g. black has checker at 5, white at 8)
+    board_contact = jnp.zeros(28, dtype=BOARD_DTYPE)
+    board_contact = board_contact.at[5].set(2)
+    board_contact = board_contact.at[8].set(-2)
+    assert not _is_no_contact(board_contact)
+
+    # Case 3: No contact (black has checker at 12, white at 8. They have crossed paths)
+    board_no_contact = jnp.zeros(28, dtype=BOARD_DTYPE)
+    board_no_contact = board_no_contact.at[12].set(2)
+    board_no_contact = board_no_contact.at[8].set(-2)
+    assert _is_no_contact(board_no_contact)
+
+    # Case 4: No contact, with bar checkers
+    # If black has a checker on the bar (index 24, pos -1), and white has checkers on the board (e.g., at 0)
+    # White's backmost checker is at 0. Black's backmost is -1.
+    # -1 > 0 is False. So contact is still possible.
+    board_bar_black = jnp.zeros(28, dtype=BOARD_DTYPE)
+    board_bar_black = board_bar_black.at[24].set(1)  # black checker on bar
+    board_bar_black = board_bar_black.at[0].set(-1)  # white checker at 0
+    assert not _is_no_contact(board_bar_black)
+
+    # Case 5: Batched input (shape (3, 28))
+    batched_boards = jnp.stack([board_start, board_contact, board_no_contact], axis=0)
+    assert (jax.vmap(_is_no_contact)(batched_boards) == jnp.array([False, False, True])).all()
+
+
+def test_strategy_chunked_vs_standard():
+    # Setup some test states
+    board_1 = jnp.array(START_POSITIONS, dtype=BOARD_DTYPE)
+
+    board_2 = jnp.zeros(28, dtype=BOARD_DTYPE)
+    board_2 = board_2.at[5].set(2)
+    board_2 = board_2.at[8].set(-2)
+    board_2 = board_2.at[17].set(3)
+    board_2 = board_2.at[20].set(-5)
+
+    boards = jnp.stack([board_1, board_2], axis=0)
+    dice = jnp.array([[2, 4], [3, 5]], dtype=BOARD_DTYPE)
+
+    # We initialize states
+    # Let's map env.init to create a batch of two states, then replace board and playable_dice
+    env_instance = Backgammon()
+    dummy_states = jax.vmap(env_instance.init)(jax.random.split(jax.random.PRNGKey(42), 2))
+
+    test_states = dummy_states.replace(
+        _board=boards,
+        _playable_dice=dice
+    )
+
+    # Evaluate using standard 2-ply strategy
+    strat_std = BackgammonTwoPlyStrategy(env_instance)
+    best_action_std, equities_std, candidate_action_indices_std = strat_std.get_next_action_and_equities_batch(
+        test_states, jax.random.PRNGKey(0), SimpleBackgammonEvaluatorConfig(), SimpleBackgammonEvaluator
+    )
+
+    # Evaluate using chunked 2-ply strategy
+    strat_chk = BackgammonTwoPlyChunkedStrategy(env_instance)
+    best_action_chk, equities_chk, candidate_action_indices_chk = strat_chk.get_next_action_and_equities_batch(
+        test_states, jax.random.PRNGKey(0), SimpleBackgammonEvaluatorConfig(), SimpleBackgammonEvaluator
+    )
+
+    # Assertions
+    assert (best_action_std == best_action_chk).all(), f"Actions mismatch: {best_action_std} vs {best_action_chk}"
+    assert jnp.allclose(equities_std, equities_chk, atol=1e-5, equal_nan=True), f"Equities mismatch: {equities_std} vs {equities_chk}"
+    assert (candidate_action_indices_std == candidate_action_indices_chk).all()
+

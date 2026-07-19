@@ -52,19 +52,25 @@ class AZNet(hk.Module):
         decay_rate: float = 0.9,
         kernel_shape: int = 3,   # kernel shape when doing initial conv2D layers in resnet blocks
         resnet_v2: bool = True,
+        train_policy_network: bool = True,
+        num_value_channels: int = 1,
+        dtype=jnp.float32,
         name="az_net",
-    ):
-        super().__init__(name=name)
-        self.num_actions = num_actions
-        self.num_channels = num_channels
-        self.num_blocks = num_blocks
-        self.decay_rate = decay_rate
-        self.kernel_shape = kernel_shape
-        self.resnet_v2 = resnet_v2
-        self.resnet_cls = BlockV2 if resnet_v2 else BlockV1
+     ):
+         super().__init__(name=name)
+         self.num_actions = num_actions
+         self.num_channels = num_channels
+         self.num_blocks = num_blocks
+         self.decay_rate = decay_rate
+         self.kernel_shape = kernel_shape
+         self.resnet_v2 = resnet_v2
+         self.train_policy_network = train_policy_network
+         self.num_value_channels = num_value_channels
+         self.dtype = dtype
+         self.resnet_cls = BlockV2 if resnet_v2 else BlockV1
 
     def __call__(self, x, is_training, test_local_stats):
-        x = x.astype(jnp.float32)
+        x = x.astype(self.dtype)
         x = hk.Conv2D(self.num_channels, kernel_shape=self.kernel_shape)(x)
 
         if not self.resnet_v2:
@@ -81,11 +87,14 @@ class AZNet(hk.Module):
             x = jax.nn.relu(x)
 
         # policy head
-        logits = hk.Conv2D(output_channels=2, kernel_shape=1)(x)
-        logits = hk.BatchNorm(True, True, self.decay_rate)(logits, is_training, test_local_stats)
-        logits = jax.nn.relu(logits)
-        logits = hk.Flatten()(logits)
-        logits = hk.Linear(self.num_actions)(logits)
+        if self.train_policy_network:
+            logits = hk.Conv2D(output_channels=2, kernel_shape=1)(x)
+            logits = hk.BatchNorm(True, True, self.decay_rate)(logits, is_training, test_local_stats)
+            logits = jax.nn.relu(logits)
+            logits = hk.Flatten()(logits)
+            logits = hk.Linear(self.num_actions)(logits)
+        else:
+            logits = None
 
         # value head
         v = hk.Conv2D(output_channels=1, kernel_shape=1)(x)
@@ -94,8 +103,7 @@ class AZNet(hk.Module):
         v = hk.Flatten()(v)
         v = hk.Linear(self.num_channels)(v)
         v = jax.nn.relu(v)
-        v = hk.Linear(1)(v)
+        v = hk.Linear(self.num_value_channels)(v)
         v = jnp.tanh(v)
-        v = v.reshape((-1,))
 
         return logits, v

@@ -120,7 +120,7 @@ class State(abc.ABC):
         return jnp.full(self.current_player.shape, -jnp.inf, dtype=jnp.float32)
 
     def has_chance_logits(self, chance_logits) -> Array:
-        return (~jnp.isneginf(chance_logits)).any()
+        return (~jnp.isneginf(chance_logits)).any(axis=-1)
 
     def has_chance_logits_recalc(self) -> Array:
         return self.has_chance_logits(self.get_chance_logits())
@@ -459,18 +459,28 @@ def make(env_id: EnvId):  # noqa: C901
 
 
 class Strategy(abc.ABC):
-    @abc.abstractmethod
     def get_next_action_batch(self, state: State, rng_key: Array, config, model_cls) -> Array:
-        pass
+        best_action, _equities, _action_indices = self.get_next_action_and_equities_batch(state, rng_key, config, model_cls)
+        return best_action 
+
+    def get_next_action_and_equities_batch(self, state: State, rng_key: Array, config, model_cls) -> tuple:
+        raise NotImplementedError("This strategy does not support get_next_action_and_equities_batch.")
 
 
 @jax.jit(static_argnames=('repeat_factor',))
 def broadcast_config(config, repeat_factor: int):
+    if not getattr(config, "should_broadcast", True):
+        return config
+
+    def repeat_leaf(x):
+        val = jnp.atleast_1d(x)
+        repeated = jnp.repeat(val[:, jnp.newaxis, ...], repeat_factor, axis=1)
+        return repeated.reshape((-1,) + val.shape[1:])
+
     new_fields = {}
     for field in dataclasses.fields(config):
         val = getattr(config, field.name)
-        repeated = jnp.repeat(val[:, jnp.newaxis, ...], repeat_factor, axis=1)
-        new_fields[field.name] = repeated.reshape((-1,) + val.shape[1:])
+        new_fields[field.name] = jax.tree_util.tree_map(repeat_leaf, val)
     return type(config)(**new_fields)
 
 
@@ -503,6 +513,12 @@ class OnePlyStrategy(Strategy):
 
 
 class Evaluator(abc.ABC):
+    def __init__(self, config=None):
+        self.config = config
+
+    def get_config(self):
+        return self.config
+
     @abc.abstractmethod
-    def eval(self, state: State) -> Array:
+    def eval(self, state: State, idx: Optional[Array] = None) -> Array:
         pass

@@ -17,7 +17,7 @@ import time
 
 import pickle
 from omegaconf import OmegaConf
-from pydantic import BaseModel
+from pydantic import BaseModel, ConfigDict
 import wandb
 
 
@@ -46,8 +46,7 @@ class PPOConfig(BaseModel):
     wandb_project: str = "pgx-minatar-ppo"
     save_model: bool = False
 
-    class Config:
-        extra = "forbid"
+    model_config = ConfigDict(extra='forbid')
 
 
 args = PPOConfig(**OmegaConf.to_object(OmegaConf.from_cli()))
