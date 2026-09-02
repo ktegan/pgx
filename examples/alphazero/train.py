@@ -309,12 +309,14 @@ def make_recurrent_fn(value_to_scalar_fn, forward, env, config):
     def recurrent_fn(model_config, rng_key: jnp.ndarray, action: jnp.ndarray, state: pgx.State):
         # model_config: NNConfig
         # state: embedding
-        del rng_key
         model_params = model_config.model_params
         model_state = model_config.model_state
 
         previous_player = state.current_player
-        state = jax.vmap(env.step)(state, action)
+        # backgammon requires a PRNGKey per game even though dice rolls are
+        # chance actions; the env dynamics themselves are deterministic
+        step_keys = jax.random.split(rng_key, state.observation.shape[0])
+        state = jax.vmap(env.step)(state, action, step_keys)
         current_player = state.current_player
 
         (logits, value), _ = forward.apply(model_params, model_state, state.observation, is_eval=True)
