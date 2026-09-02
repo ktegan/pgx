@@ -136,3 +136,39 @@ def test_recurrent_fn_discount_ignores_values_nodes_at_turn_end():
         )
         assert (next_state.current_player == 1 - no_move_states.current_player).all()
         assert (out.discount == -1.0).all(), f"flag={flag}: discount {out.discount}"
+
+
+def test_td_lambda_targets_propagate_through_rolls_and_turns():
+    """Bug E was a misdiagnosis: the TD(lambda) chain in compute_loss_input uses
+    the selfplay step discounts (+1 same player / roll, -1 turn change, 0
+    terminal), which are NOT zeroed by values_nodes_at_turn_end (that zeroing
+    only ever existed in the MCTS backup, see the bug-D fix).  This test pins
+    the semantics: a terminal outcome must propagate back through dice-roll
+    edges unchanged and flip sign across turn-change edges."""
+    from examples.alphazero.train import SelfplayOutput, make_compute_loss_input_fn
+
+    max_num_steps, B, nvc, lam = 4, 2, 1, 0.9
+    config = Config(
+        selfplay_batch_size=B, max_num_steps=max_num_steps, num_value_channels=nvc, td_lambda=lam
+    )
+    compute_loss_input = make_compute_loss_input_fn(lambda r: r[..., jnp.newaxis], config)
+
+    data = SelfplayOutput(
+        obs=jnp.zeros((1, max_num_steps, B, 24, 1, 12)),
+        reward=jnp.tile(jnp.array([0.0, 0.0, 0.0, 1.0])[None, :, None], (1, 1, B)),
+        terminated=jnp.tile(jnp.array([False, False, False, True])[None, :, None], (1, 1, B)),
+        action_weights=jnp.zeros((1, max_num_steps, B, ACTION_TOTAL_LENGTH)),
+        discount=jnp.tile(jnp.array([1.0, -1.0, 1.0, 0.0])[None, :, None], (1, 1, B)),
+        is_chance_node=jnp.zeros((1, max_num_steps, B), dtype=jnp.bool_),
+        value=jnp.tile(jnp.array([0.5, 0.3, 0.2, 0.1])[None, :, None, None], (1, 1, B, 1)),
+        is_turn_end=jnp.zeros((1, max_num_steps, B), dtype=jnp.bool_),
+    )
+    sample = compute_loss_input(data)
+    # v3 = r3 = 1.0
+    # v2 = +1 * (0.1*v[3] + 0.9*v3) = 0.91          (roll edge, same player)
+    # v1 = -1 * (0.1*v[2] + 0.9*v2) = -0.839        (turn change, sign flips)
+    # v0 = +1 * (0.1*v[1] + 0.9*v1) = -0.7251       (roll edge)
+    expected = jnp.array([-0.7251, -0.839, 0.91, 1.0])
+    assert jnp.allclose(sample.value_tgt[0, :, 0, 0], expected, atol=1e-4), sample.value_tgt[0, :, 0, 0]
+    # the terminal outcome reaches the first node of the horizon: not severed
+    assert abs(float(sample.value_tgt[0, 0, 0, 0])) > 0.5
