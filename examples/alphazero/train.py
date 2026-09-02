@@ -68,7 +68,7 @@ num_devices = len(devices)
 # possible things to try: Regret Matching
 
 
-SNAPSHOT_ITERS = 1
+SNAPSHOT_ITERS = 4
 
 
 @dataclass
@@ -719,10 +719,11 @@ def main_selfplay():
         values_nodes_at_turn_end=True,
         num_value_channels=6,
         #selfplay_batch_size=8,
-        #load_checkpoint_path='checkpoints/distill_20260702_16:06:35_03000.pkl',
+        load_checkpoint_path='checkpoints/distill_20260702_16:06:35_03000.pkl',
         #load_checkpoint_path='checkpoints/selfplay_20260703_17:33:28_00035.pkl',
         #load_checkpoint_path='checkpoints/selfplay_20260704_11:32:50_00008.pkl',
-        load_checkpoint_path='checkpoints/selfplay_20260705_21:11:04_00033.pkl',
+        #load_checkpoint_path='checkpoints/selfplay_20260705_21:11:04_00033.pkl',
+        #load_checkpoint_path='checkpoints/selfplay_20260711_16:51:20_00133.pkl',
         #max_num_iters=4,
         #load_checkpoint_champion_paths=[
         #    'checkpoints/selfplay_20260704_11:32:50_00008.pkl',
