@@ -1194,6 +1194,22 @@ def _evaluate_boards(boards: Array, mask: Array, evaluator, micro_batch_size: Op
     return jnp.where(mask, equities, jnp.finfo(equities.dtype).min)
 
 
+def _with_dice_roll_action(state: core.State, rng_key: Array, best_action: Array) -> Array:
+    """
+    Return the action a strategy should take.
+
+    At chance nodes (start of a turn, dice not yet rolled) the action space is
+    the 21 dice pairs, so the move candidates evaluated for the current board
+    are meaningless.  Sample the roll from the chance logits, which carry the
+    true dice probabilities (2/36 per non-double, 1/36 per double).  At no-move
+    nodes best_action is already the NOOP pass.
+    """
+    chance_logits = state.get_chance_logits()
+    is_chance = state.has_chance_logits(chance_logits)
+    dice_action = jax.random.categorical(rng_key, chance_logits, axis=-1)
+    return jnp.where(is_chance, dice_action, best_action)
+
+
 class BackgammonTwoPlyStrategy(core.Strategy):
     CHUNK_SIZE = IN_GAME_POSITIONS // 2
     NUM_CHUNKS = NUM_DICE * 2
@@ -1333,9 +1349,10 @@ class BackgammonTwoPlyStrategy(core.Strategy):
             candidate_equities=candidate_equities
         )
 
-    def get_next_action_and_equities_batch(self, state: core.State, _rng_key: Array, config, eval_cls) -> tuple:
+    def get_next_action_and_equities_batch(self, state: core.State, rng_key: Array, config, eval_cls) -> tuple:
         res = self._evaluate_2ply_details(state, config, eval_cls)
-        return res.best_action_nd, res.candidate_equities, res.candidate_action_indices
+        best_action = _with_dice_roll_action(state, rng_key, res.best_action_nd)
+        return best_action, res.candidate_equities, res.candidate_action_indices
 
 
 class BackgammonTwoPlyChunkedStrategy(core.Strategy):
@@ -1457,9 +1474,10 @@ class BackgammonTwoPlyChunkedStrategy(core.Strategy):
             candidate_equities=candidate_equities
         )
 
-    def get_next_action_and_equities_batch(self, state: core.State, _rng_key: Array, config, eval_cls) -> tuple:
+    def get_next_action_and_equities_batch(self, state: core.State, rng_key: Array, config, eval_cls) -> tuple:
         res = self._evaluate_2ply_details(state, config, eval_cls)
-        return res.best_action_nd, res.candidate_equities, res.candidate_action_indices
+        best_action = _with_dice_roll_action(state, rng_key, res.best_action_nd)
+        return best_action, res.candidate_equities, res.candidate_action_indices
 
 
 class BackgammonFullTurnStrategy(core.Strategy):

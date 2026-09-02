@@ -18,9 +18,15 @@ from pgx.backgammon import (
     State,
     Backgammon,
     SimpleBackgammonEvaluator,
+    SimpleBackgammonEvaluatorConfig,
     BackgammonTwoPlyStrategy,
     BackgammonTwoPlyChunkedStrategy,
     BackgammonFullTurnStrategy,
+    ACTION_CHANCE_LENGTH,
+    ACTION_MOVE_LENGTH,
+    BAR_IDX,
+    NO_MOVE,
+    NOOP_ACTION_IDX,
     _decompose_action,
     _to_playable_dice_count,
     _flip_board,
@@ -1937,3 +1943,65 @@ def test_strategy_chunked_vs_standard():
     assert jnp.allclose(equities_std, equities_chk, atol=1e-5, equal_nan=True), f"Equities mismatch: {equities_std} vs {equities_chk}"
     assert (candidate_action_indices_std == candidate_action_indices_chk).all()
 
+
+
+def test_strategy_action_at_chance_node():
+    """At a chance node (turn changed, dice not rolled) the strategy must return
+    a legal dice-roll action, sampled with the true dice odds, not a move."""
+    B = 4
+    states = jax.vmap(env.init)(jax.random.split(jax.random.PRNGKey(0), B))
+    # force pre-roll chance nodes by ending the current turn
+    chance_states = jax.vmap(_change_turn)(states, jax.random.split(jax.random.PRNGKey(1), B))
+    assert chance_states.has_chance_logits(chance_states.get_chance_logits()).all()
+
+    evaluator_config = jax.tree_util.tree_map(
+        lambda x: jnp.repeat(jnp.expand_dims(x, 0), B, axis=0), SimpleBackgammonEvaluatorConfig()
+    )
+    for strategy in [BackgammonTwoPlyStrategy(env), BackgammonTwoPlyChunkedStrategy(env)]:
+        action = strategy.get_next_action_batch(
+            chance_states, jax.random.PRNGKey(2), evaluator_config, SimpleBackgammonEvaluator
+        )
+        assert (action >= ACTION_MOVE_LENGTH).all(), f"not a dice-roll action: {action}"
+        assert chance_states.legal_action_mask[jnp.arange(B), action].all()
+
+        # stepping with the roll keeps the same player and sets the dice
+        next_states = jax.vmap(env.step)(
+            chance_states, action, jax.random.split(jax.random.PRNGKey(3), B)
+        )
+        assert (next_states.current_player == chance_states.current_player).all()
+        assert (next_states._playable_dice != NO_MOVE).any(axis=-1).all()
+
+
+def test_strategy_action_at_no_move_node():
+    """At a no-move node the strategy must pass (NOOP) instead of returning an
+    illegal candidate move."""
+    B = 2
+    board = jnp.zeros(28, dtype=BOARD_DTYPE)
+    board = board.at[BAR_IDX].set(15)  # all black checkers on the bar
+    for pos, cnt in zip(range(0, 6), [3, 3, 3, 2, 2, 2]):
+        board = board.at[pos].set(-cnt)  # every entry point blocked by white
+
+    playable_dice = jnp.stack([jnp.array([2, 4, NO_MOVE, NO_MOVE])] * 2)
+    legal = jax.vmap(_arr_legal_action_mask)(jnp.stack([board, board]), playable_dice)
+    states = jax.vmap(env.init)(jax.random.split(jax.random.PRNGKey(0), B)).replace(
+        _board=jnp.stack([board, board]),
+        _playable_dice=playable_dice,
+        legal_action_mask=legal,
+    )
+    # every dice entry is blocked, so the only legal action is the NOOP pass
+    assert (legal.sum(axis=-1) == 1).all() and legal[:, NOOP_ACTION_IDX].all()
+
+    evaluator_config = jax.tree_util.tree_map(
+        lambda x: jnp.repeat(jnp.expand_dims(x, 0), B, axis=0), SimpleBackgammonEvaluatorConfig()
+    )
+    for strategy in [BackgammonTwoPlyStrategy(env), BackgammonTwoPlyChunkedStrategy(env)]:
+        action = strategy.get_next_action_batch(
+            states, jax.random.PRNGKey(2), evaluator_config, SimpleBackgammonEvaluator
+        )
+        assert (action == NOOP_ACTION_IDX).all(), f"expected NOOP, got {action}"
+        # stepping with the NOOP passes the turn without terminating
+        next_states = jax.vmap(env.step)(
+            states, action, jax.random.split(jax.random.PRNGKey(3), B)
+        )
+        assert (~next_states.terminated).all()
+        assert (next_states.current_player == 1 - states.current_player).all()

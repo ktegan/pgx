@@ -42,6 +42,7 @@ from pgx.backgammon import (
     BackgammonTwoPlyChunkedStrategy,
     SimpleBackgammonEvaluator,
     SimpleBackgammonEvaluatorConfig,
+    ACTION_TOTAL_LENGTH,
     _arr_legal_action_mask,
     _is_no_contact,
     OFF_IDX,
@@ -355,6 +356,43 @@ class SelfplayOutput(NamedTuple):
     is_turn_end: jnp.ndarray
 
 
+def strategy_action_and_weights(state, key, strategy, config, eval_cls, temperature):
+    """
+    Sample actions and policy weights for a batch of states using a backgammon
+    lookahead strategy.
+
+    Chance nodes (start of a turn, dice not yet rolled) are sampled from the
+    chance logits so rolls follow the true dice probabilities.  At no-move
+    nodes there are no legal candidate moves (all candidate equities are -inf),
+    so fall back to the strategy's best action, which is the NOOP pass there.
+    The move sampling sanitizes -inf candidate equities to avoid NaNs in the
+    softmax; those nodes' weights are never trained on (is_chance_node /
+    is_turn_end masking in the loss).
+    """
+    best_action, candidate_equities, candidate_action_indices = \
+        strategy.get_next_action_and_equities_batch(state, key, config, eval_cls)
+    key_move, key_dice = jax.random.split(key)
+
+    chance_logits = state.get_chance_logits()
+    is_chance = state.has_chance_logits(chance_logits)
+    dice_action = jax.random.categorical(key_dice, chance_logits, axis=-1)
+
+    finite = jnp.isfinite(candidate_equities)
+    has_candidates = finite.any(axis=-1)
+    logits = jnp.where(finite, candidate_equities, 0.0) / jnp.maximum(temperature, 1e-6)
+    probs = jax.nn.softmax(logits, axis=-1)
+    game_range = jnp.arange(state.observation.shape[0])
+
+    idx = jax.random.categorical(key_move, logits, axis=-1)
+    move_action = candidate_action_indices[game_range, idx]
+    move_action = jnp.where(has_candidates, move_action, best_action)
+    action = jnp.where(is_chance, dice_action, move_action)
+
+    action_weights = jnp.zeros((state.observation.shape[0], ACTION_TOTAL_LENGTH), dtype=jnp.float32)
+    action_weights = action_weights.at[game_range[:, jnp.newaxis], candidate_action_indices].set(probs)
+    return action, action_weights, is_chance
+
+
 def make_selfplay_fn(forward, value_to_scalar_fn, env, config, strategy, eval_cls):
     recurrent_fn = make_recurrent_fn(value_to_scalar_fn, forward, env, config)
 
@@ -411,21 +449,9 @@ def make_selfplay_fn(forward, value_to_scalar_fn, env, config, strategy, eval_cl
                 action = policy_output.action
                 action_weights = policy_output.action_weights
             else:
-                best_action, candidate_equities, candidate_action_indices = strategy.get_next_action_and_equities_batch(
-                    state, key1, model_config, eval_cls
+                action, action_weights, is_chance_node = strategy_action_and_weights(
+                    state, key1, strategy, model_config, eval_cls, config.temperature
                 )
-
-                # Apply softmax with temperature over candidate equities to get probabilities
-                logits = candidate_equities / jnp.maximum(config.temperature, 1e-6)
-                probs = jax.nn.softmax(logits, axis=-1)
-
-                # Sample action categorically from candidate probabilities
-                idx = jax.random.categorical(key1, logits, axis=-1)
-                action = candidate_action_indices[jnp.arange(state.observation.shape[0]), idx]
-
-                # Scatter candidate probabilities to construct full policy target
-                action_weights = jnp.zeros((state.observation.shape[0], env.num_actions), dtype=jnp.float32)
-                action_weights = action_weights.at[jnp.arange(state.observation.shape[0])[:, jnp.newaxis], candidate_action_indices].set(probs)
 
             actor = state.current_player
             keys = jax.random.split(key2, batch_size)
