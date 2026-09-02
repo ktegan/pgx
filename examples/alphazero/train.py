@@ -364,11 +364,11 @@ def strategy_action_and_weights(state, key, strategy, config, eval_cls, temperat
 
     Chance nodes (start of a turn, dice not yet rolled) are sampled from the
     chance logits so rolls follow the true dice probabilities.  At no-move
-    nodes there are no legal candidate moves (all candidate equities are -inf),
-    so fall back to the strategy's best action, which is the NOOP pass there.
-    The move sampling sanitizes -inf candidate equities to avoid NaNs in the
-    softmax; those nodes' weights are never trained on (is_chance_node /
-    is_turn_end masking in the loss).
+    nodes every candidate equity is masked to finfo.min, which overflows to
+    -inf after the temperature division, so the softmax would be NaN: fall
+    back to the strategy's best action (the NOOP pass) there and zero their
+    policy weights.  At partially-legal nodes the masked candidates stay at
+    -inf and get zero sampling probability.
     """
     best_action, candidate_equities, candidate_action_indices = \
         strategy.get_next_action_and_equities_batch(state, key, config, eval_cls)
@@ -378,10 +378,8 @@ def strategy_action_and_weights(state, key, strategy, config, eval_cls, temperat
     is_chance = state.has_chance_logits(chance_logits)
     dice_action = jax.random.categorical(key_dice, chance_logits, axis=-1)
 
-    finite = jnp.isfinite(candidate_equities)
-    has_candidates = finite.any(axis=-1)
-    logits = jnp.where(finite, candidate_equities, 0.0) / jnp.maximum(temperature, 1e-6)
-    probs = jax.nn.softmax(logits, axis=-1)
+    logits = candidate_equities / jnp.maximum(temperature, 1e-6)
+    has_candidates = jnp.isfinite(logits).any(axis=-1)
     game_range = jnp.arange(state.observation.shape[0])
 
     idx = jax.random.categorical(key_move, logits, axis=-1)
@@ -389,6 +387,8 @@ def strategy_action_and_weights(state, key, strategy, config, eval_cls, temperat
     move_action = jnp.where(has_candidates, move_action, best_action)
     action = jnp.where(is_chance, dice_action, move_action)
 
+    probs = jax.nn.softmax(logits, axis=-1)
+    probs = jnp.where(has_candidates[:, jnp.newaxis], probs, 0.0)
     action_weights = jnp.zeros((state.observation.shape[0], ACTION_TOTAL_LENGTH), dtype=jnp.float32)
     action_weights = action_weights.at[game_range[:, jnp.newaxis], candidate_action_indices].set(probs)
     return action, action_weights, is_chance
