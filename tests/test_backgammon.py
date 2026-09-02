@@ -24,6 +24,7 @@ from pgx.backgammon import (
     BackgammonFullTurnStrategy,
     ACTION_CHANCE_LENGTH,
     ACTION_MOVE_LENGTH,
+    ACTION_TOTAL_LENGTH,
     BAR_IDX,
     NO_MOVE,
     NOOP_ACTION_IDX,
@@ -2005,3 +2006,35 @@ def test_strategy_action_at_no_move_node():
         )
         assert (~next_states.terminated).all()
         assert (next_states.current_player == 1 - states.current_player).all()
+
+
+def test_get_normal_or_chance_logits_batched():
+    """get_normal_or_chance_logits must work on batched states directly (no
+    vmap): chance rows get the chance logits, other rows keep the given logits."""
+    B = 4
+    states = jax.vmap(env.init)(jax.random.split(jax.random.PRNGKey(0), B))
+    chance_states = jax.vmap(_change_turn)(states, jax.random.split(jax.random.PRNGKey(1), B))
+    # batch with two chance nodes and two normal nodes
+    mixed_states = jax.tree_util.tree_map(
+        lambda a, b: jnp.concatenate([a[:2], b[:2]], axis=0), chance_states, states
+    )
+
+    logits = jnp.arange(B * ACTION_TOTAL_LENGTH, dtype=jnp.float32).reshape(B, ACTION_TOTAL_LENGTH)
+    out = mixed_states.get_normal_or_chance_logits(logits, mixed_states.get_chance_logits())
+
+    chance_logits = mixed_states.get_chance_logits()
+    expected = jnp.where(mixed_states.has_chance_logits(chance_logits)[:, jnp.newaxis],
+                         chance_logits, logits)
+    assert jnp.array_equal(out, expected)
+    # chance rows carry finite dice logits only on the chance actions
+    assert (~jnp.isneginf(out[0, ACTION_MOVE_LENGTH:])).any()
+    assert jnp.isneginf(out[0, :ACTION_MOVE_LENGTH]).all()
+    # normal rows pass the given logits through untouched
+    assert jnp.array_equal(out[2:], logits[2:])
+    # recalc variant on a batched state works too
+    out2 = mixed_states.get_normal_or_chance_logits_recalc(logits)
+    assert jnp.array_equal(out2, expected)
+    # and the unbatched case still works
+    single = jax.tree_util.tree_map(lambda x: x[2], mixed_states)
+    out3 = single.get_normal_or_chance_logits(logits[2], single.get_chance_logits())
+    assert jnp.array_equal(out3, logits[2])

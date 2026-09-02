@@ -130,7 +130,12 @@ class State(abc.ABC):
         Assuming that every node is either a chance node or an action node this
         returns chance logits if any are available, otherwise non-chance logits.
         """
-        return jnp.where(self.has_chance_logits(chance_logits), chance_logits, logits)
+        has_chance = self.has_chance_logits(chance_logits)
+        # has_chance is per game (shape [...]); broadcast it against the
+        # (..., num_actions) logits so batched states work without vmap
+        while has_chance.ndim < logits.ndim:
+            has_chance = has_chance[..., jnp.newaxis]
+        return jnp.where(has_chance, chance_logits, logits)
 
     def get_normal_or_chance_logits_recalc(self, logits:Array) -> Array:
         return self.get_normal_or_chance_logits(logits, self.get_chance_logits())
