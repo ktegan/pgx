@@ -332,11 +332,10 @@ def make_recurrent_fn(value_to_scalar_fn, forward, env, config):
         discount = jnp.where(previous_player == current_player, 1.0, -1.0) * jnp.ones_like(value)
         discount = jnp.where(state.terminated, 0.0, discount)
         rewards = state.rewards[jnp.arange(state.rewards.shape[0]), previous_player]
-        # when training the value network on turn end, we only train on nodes where the active player changed or game terminated.
-        # we still do self-play transitions on chance nodes and same-player turns but mask out their value targets.
-        is_turn_end = (previous_player != current_player) | state.terminated
-        # if using custom value target training nodes, then if not turn end return 0 discount, meaning the value target is not bootstrap-updated
-        discount = jnp.where(config.values_nodes_at_turn_end & ~is_turn_end, 0.0, discount)
+        # NOTE: values_nodes_at_turn_end only selects which nodes the value loss
+        # is computed on (see loss_fn); it must never touch the search backup,
+        # where a +1 discount is required to propagate values through dice rolls
+        # and same-player moves.  Zeroing it here collapsed MCTS node values.
         recurrent_fn_output = mctx.RecurrentFnOutput(
             reward=rewards,
             discount=discount,
