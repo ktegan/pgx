@@ -1203,10 +1203,15 @@ def _with_dice_roll_action(state: core.State, rng_key: Array, best_action: Array
     are meaningless.  Sample the roll from the chance logits, which carry the
     true dice probabilities (2/36 per non-double, 1/36 per double).  At no-move
     nodes best_action is already the NOOP pass.
+
+    Accepts either a single PRNGKey or a batch of per-game keys.
     """
     chance_logits = state.get_chance_logits()
     is_chance = state.has_chance_logits(chance_logits)
-    dice_action = jax.random.categorical(rng_key, chance_logits, axis=-1)
+    if rng_key.ndim > 1:  # a batch of per-game keys, shape (B, 2)
+        dice_action = jax.vmap(jax.random.categorical, in_axes=(0, 0))(rng_key, chance_logits)
+    else:  # a single key, shape (2,); categorical handles batched logits
+        dice_action = jax.random.categorical(rng_key, chance_logits, axis=-1)
     return jnp.where(is_chance, dice_action, best_action)
 
 
