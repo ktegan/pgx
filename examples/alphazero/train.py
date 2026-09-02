@@ -614,6 +614,18 @@ def make_train_fn(optimizer, loss_fn):
     return train
 
 
+def _sample_action_with_dice(state, key, logits):
+    """Sample an action from legal-masked `logits`, but at chance nodes sample
+    the dice roll from the chance logits so rolls follow the true 1/36, 2/36
+    dice probabilities instead of the network's distribution over the 21 pairs."""
+    key_move, key_dice, key_next = jax.random.split(key, 3)
+    move_action = jax.random.categorical(key_move, logits, axis=-1)
+    chance_logits = state.get_chance_logits()
+    is_chance = state.has_chance_logits(chance_logits)
+    dice_action = jax.random.categorical(key_dice, chance_logits, axis=-1)
+    return jnp.where(is_chance, dice_action, move_action), key_next
+
+
 def make_evaluate_baseline_fn(forward, env, config):
     @jax.pmap
     def evaluate_baseline(baseline, rng_key, my_model):
@@ -635,9 +647,9 @@ def make_evaluate_baseline_fn(forward, env, config):
             opp_logits, _ = baseline(state.observation)
             is_my_turn = (state.current_player == my_player).reshape((-1, 1))
             logits = jnp.where(is_my_turn, my_logits, opp_logits)
-            key, subkey = jax.random.split(key)
-            action = jax.random.categorical(subkey, logits, axis=-1)
-            state = jax.vmap(env.step)(state, action)
+            action, key = _sample_action_with_dice(state, key, logits)
+            step_keys = jax.random.split(key, batch_size)
+            state = jax.vmap(env.step)(state, action, step_keys)
             new_terminated = state.terminated
             reward_mask = new_terminated & ~terminated
             R = R + state.rewards[jnp.arange(batch_size), my_player] * reward_mask
@@ -719,8 +731,8 @@ def make_evaluate_fn(forward, env, config):
             logits = logits - jnp.max(logits, axis=-1, keepdims=True)
             logits = jnp.where(state.legal_action_mask, logits, jnp.finfo(logits.dtype).min)
 
-            key, subkey1, subkey2 = jax.random.split(key, 3)
-            action = jax.random.categorical(subkey1, logits, axis=-1)
+            action, key = _sample_action_with_dice(state, key, logits)
+            key, subkey2 = jax.random.split(key)
             step_keys = jax.random.split(subkey2, eval_batch_size)
             state = jax.vmap(env.step)(state, action, step_keys)
             new_terminated = state.terminated

@@ -172,3 +172,40 @@ def test_td_lambda_targets_propagate_through_rolls_and_turns():
     assert jnp.allclose(sample.value_tgt[0, :, 0, 0], expected, atol=1e-4), sample.value_tgt[0, :, 0, 0]
     # the terminal outcome reaches the first node of the horizon: not severed
     assert abs(float(sample.value_tgt[0, 0, 0, 0])) > 0.5
+
+
+def test_sample_action_with_dice_uses_true_odds():
+    """Bug F: at chance nodes the dice must be sampled from the chance logits
+    (doubles 1/36, non-doubles 2/36) rather than uniformly over the 21 pairs."""
+    from pgx.backgammon import ALL_DICE_PAIRS
+    from examples.alphazero.train import _sample_action_with_dice
+
+    B = 1
+    states = jax.vmap(env.init)(jax.random.split(jax.random.PRNGKey(0), B))
+    chance_states = jax.vmap(_change_turn)(states, jax.random.split(jax.random.PRNGKey(1), B))
+
+    n = 21000
+    keys = jax.random.split(jax.random.PRNGKey(2), n)
+    logits = jnp.zeros((B, ACTION_TOTAL_LENGTH))
+    actions = jax.jit(jax.vmap(lambda k: _sample_action_with_dice(chance_states, k, logits)[0]))(keys)
+    assert actions.shape == (n, B)
+    # every sampled action is a dice-roll action
+    assert (actions >= ACTION_MOVE_LENGTH).all()
+
+    # doubles are the pairs (d, d); P(doubles) must be 1/6, not 6/21
+    double_pair_idx = jnp.array(
+        [i for i, (a, b) in enumerate(ALL_DICE_PAIRS.tolist()) if a == b], dtype=jnp.int32
+    )
+    is_double = jnp.isin(actions[:, 0] - ACTION_MOVE_LENGTH, double_pair_idx)
+    frac = float(is_double.mean())
+    assert abs(frac - 1 / 6) < 0.02, f"doubles frequency {frac:.4f} != 1/6"
+
+    # at a normal (post-roll) node the move logits are used: sampling from
+    # legal-masked one-hot logits must always select a legal action
+    legal = states.legal_action_mask
+    one_hot = jnp.log(legal.astype(jnp.float32) + 1e-8)
+    acts = jax.jit(jax.vmap(lambda k: _sample_action_with_dice(states, k, one_hot)[0]))(
+        jax.random.split(jax.random.PRNGKey(3), 200)
+    )
+    selected_legal = legal[jnp.arange(B)[None, :], acts]
+    assert bool(selected_legal.all())
