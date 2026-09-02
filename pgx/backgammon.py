@@ -1411,9 +1411,15 @@ class BackgammonTwoPlyChunkedStrategy(core.Strategy):
         best_one_move_action = candidate_action_indices[jnp.arange(B), best_one_move_action_idx]
 
         # 2. 2-move evaluation
+        # The second move candidate j uses the same per-game candidate diffs as
+        # the first move: two_move_legal_per_die[b, i, j] says whether playing
+        # first-move candidate i and then second-move candidate j is legal, and
+        # candidate_diffs[b, j] is the board diff of candidate j.  (Using the
+        # global ONE_MOVE_BOARD_DIFFS here misaligns the (B, 52, 156) expansion
+        # with the (B, 52, 52) legality mask.)
         two_move_boards = _arr_make_new_boards(
-            one_move_boards_per_die[:, :, jnp.newaxis, :],       # shape: (B, 52, 1, 28)
-            ONE_MOVE_BOARD_DIFFS[jnp.newaxis, jnp.newaxis, :, :]  # shape: (1, 1, 52, 28)
+            one_move_boards_per_die[:, :, jnp.newaxis, :],        # shape: (B, 52, 1, 28)
+            candidate_diffs[:, jnp.newaxis, :, :],                # shape: (B, 1, 52, 28)
         ) # shape: (B, 52, 52, 28)
 
         flat_two_move_boards = two_move_boards.reshape((-1, ALL_GAME_POSITIONS))
@@ -1428,12 +1434,18 @@ class BackgammonTwoPlyChunkedStrategy(core.Strategy):
             # Avoid rebuilding the evaluator class inside vmap
             return eval_2ply.eval(dummy_state, idx=idx)[0]
 
-        indices, flat_equities = chunked_map(
+        indices, selected_equities = chunked_map(
             eval_single,
             (flat_two_move_boards, jnp.arange(N_flat)),
             flat_legal,
             chunk_size=micro_batch_size
         )
+        # chunked_map returns one result per *selected* row (compacted order,
+        # unselected rows reported as index N); scatter them back to their
+        # original flat positions so the (B, 52, 52) reshape stays aligned
+        # with two_move_legal_per_die.  Unselected entries stay 0 and are
+        # masked to -inf below.
+        flat_equities = jnp.zeros(N_flat, dtype=selected_equities.dtype).at[indices].set(selected_equities)
 
         two_move_equities = flat_equities.reshape((B, 52, 52))
         two_move_equities = jnp.where(two_move_legal_per_die, two_move_equities, jnp.finfo(two_move_equities.dtype).min)

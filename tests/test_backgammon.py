@@ -1927,16 +1927,22 @@ def test_strategy_chunked_vs_standard():
         _playable_dice=dice
     )
 
+    # evaluators with per-candidate weights need one config row per game
+    evaluator_config = jax.tree_util.tree_map(
+        lambda x: jnp.repeat(jnp.expand_dims(x, 0), boards.shape[0], axis=0),
+        SimpleBackgammonEvaluatorConfig(),
+    )
+
     # Evaluate using standard 2-ply strategy
     strat_std = BackgammonTwoPlyStrategy(env_instance)
     best_action_std, equities_std, candidate_action_indices_std = strat_std.get_next_action_and_equities_batch(
-        test_states, jax.random.PRNGKey(0), SimpleBackgammonEvaluatorConfig(), SimpleBackgammonEvaluator
+        test_states, jax.random.PRNGKey(0), evaluator_config, SimpleBackgammonEvaluator
     )
 
     # Evaluate using chunked 2-ply strategy
     strat_chk = BackgammonTwoPlyChunkedStrategy(env_instance)
     best_action_chk, equities_chk, candidate_action_indices_chk = strat_chk.get_next_action_and_equities_batch(
-        test_states, jax.random.PRNGKey(0), SimpleBackgammonEvaluatorConfig(), SimpleBackgammonEvaluator
+        test_states, jax.random.PRNGKey(0), evaluator_config, SimpleBackgammonEvaluator
     )
 
     # Assertions
