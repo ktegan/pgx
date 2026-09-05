@@ -43,7 +43,11 @@ from pgx.backgammon import (
     SimpleBackgammonEvaluator,
     SimpleBackgammonEvaluatorConfig,
     ACTION_TOTAL_LENGTH,
+    NOOP_ACTION_IDX,
     _arr_legal_action_mask,
+    _arr_legal_action_mask_details,
+    _arr_make_new_boards,
+    _make_observation,
     _is_no_contact,
     OFF_IDX,
     START_POSITIONS,
@@ -420,7 +424,10 @@ def strategy_action_and_weights(state, key, strategy, config, eval_cls, temperat
     probs = jax.nn.softmax(logits, axis=-1)
     probs = jnp.where(has_candidates[:, jnp.newaxis], probs, 0.0)
     action_weights = jnp.zeros((state.observation.shape[0], ACTION_TOTAL_LENGTH), dtype=jnp.float32)
-    action_weights = action_weights.at[game_range[:, jnp.newaxis], candidate_action_indices].set(probs)
+    # scatter-max: candidate_action_indices can contain duplicates (doubles and
+    # single-die states give die1_idx == die2_idx); .set() would clobber a legal
+    # candidate's prob with a later duplicate's 0
+    action_weights = action_weights.at[game_range[:, jnp.newaxis], candidate_action_indices].max(probs)
     return action, action_weights, is_chance
 
 
@@ -691,45 +698,60 @@ def _sample_action_with_dice(state, key, logits):
     return jnp.where(is_chance, dice_action, move_action), key_next
 
 
-def make_evaluate_baseline_fn(forward, env, config):
-    @jax.pmap
-    def evaluate_baseline(baseline, rng_key, my_model):
-        """A simplified evaluation by sampling. Only for debugging.
-        Please use MCTS and run tournaments for serious evaluation."""
-        my_player = 0
-        my_model_params, my_model_state = my_model
 
-        key, subkey = jax.random.split(rng_key)
-        batch_size = config.selfplay_batch_size // jax.device_count()
-        keys = jax.random.split(subkey, batch_size)
-        state = jax.vmap(env.init)(keys)
+def _value_lookahead_logits(forward, value_to_scalar_fn, my_params, my_state, opp_params, opp_state,
+                            is_my_turn, state, num_actions, temperature):
+    """Per-move-action logits from the value head: every legal first-move
+    candidate is enumerated with the same rules the strategies use and scored
+    by the side-to-move's value net (1-ply lookahead, the same player type the
+    checkpoint tournament uses).  Sampling from these logits with
+    _sample_action_with_dice makes eval games value-head contests instead of
+    the uniform-random play a value-only net's zero logits would give."""
+    B = state._board.shape[0]
+    details = jax.vmap(_arr_legal_action_mask_details)(state._board, state._playable_dice)
+    has_two = details.two_move_legal_per_die.any(axis=(-2, -1))
+    legal = jnp.where(has_two[:, jnp.newaxis],
+                      details.two_move_legal_per_die.any(axis=-1),
+                      details.one_move_legal_per_die)                    # (B, 52)
 
-        def body_fn(val):
-            key, state, R, terminated = val
-            (my_logits, _), _ = forward.apply(
-                my_model_params, my_model_state, state.observation, is_eval=True
-            )
-            opp_logits, _ = baseline(state.observation)
-            is_my_turn = (state.current_player == my_player).reshape((-1, 1))
-            logits = jnp.where(is_my_turn, my_logits, opp_logits)
-            action, key = _sample_action_with_dice(state, key, logits)
-            step_keys = jax.random.split(key, batch_size)
-            state = jax.vmap(env.step)(state, action, step_keys)
-            new_terminated = state.terminated
-            reward_mask = new_terminated & ~terminated
-            R = R + state.rewards[jnp.arange(batch_size), my_player] * reward_mask
-            return (key, state, R, new_terminated)
+    boards = _arr_make_new_boards(state._board[:, jnp.newaxis, :], details.candidate_diffs)  # (B, 52, 28)
+    obs = jax.vmap(_make_observation)(boards.reshape((-1, ALL_GAME_POSITIONS)))              # (B*52, ...)
 
-        _, _, R, _ = jax.lax.while_loop(
-            lambda x: ~(x[1].terminated.all()),
-            body_fn,
-            (key, state, jnp.zeros(batch_size), jnp.zeros(batch_size, dtype=jnp.bool_))
-        )
-        return R
-    return evaluate_baseline
+    # my net is one model: evaluate all candidate boards in a single pass
+    (_, v_my), _ = forward.apply(my_params, my_state, obs, is_eval=True)
+    eq_my = value_to_scalar_fn(v_my).reshape(B, 52)
+
+    # opponents: k distinct nets, games laid out champion-major
+    k = jax.tree_util.tree_leaves(opp_params)[0].shape[0]
+    games_per_champ = B // k
+    obs_by_champ = obs.reshape(k, games_per_champ * 52, *state.observation.shape[1:])
+    (_, v_opp), _ = jax.vmap(
+        lambda p, s, o: forward.apply(p, s, o, is_eval=True)
+    )(opp_params, opp_state, obs_by_champ)
+    eq_opp = value_to_scalar_fn(v_opp).reshape(B, 52)
+
+    eq = jnp.where(is_my_turn[:, jnp.newaxis], eq_my, eq_opp)
+
+    # mask candidate equities before scattering into the full action axis
+    eq = jnp.where(legal, eq, jnp.finfo(eq.dtype).min)
+    logits = jnp.full((B, num_actions), jnp.finfo(jnp.float32).min)
+    game_range = jnp.arange(B)
+    # scatter-max, not scatter-set: with doubles (or a single playable die) the
+    # sorted dice give die1_idx == die2_idx, so first- and second-die candidates
+    # map to the same action index; a later illegal duplicate would clobber the
+    # legal candidate's equity with .set() (the env's own legal mask unions the
+    # duplicates via .add(), so this must match that semantics)
+    logits = logits.at[game_range[:, jnp.newaxis], details.candidate_action_indices].max(eq)
+    # no legal move at all: the only pass is NOOP
+    logits = logits.at[game_range, NOOP_ACTION_IDX].set(
+        jnp.where(legal.any(axis=-1), jnp.float32(-jnp.inf), jnp.float32(0.0))
+    )
+    # fixed low temperature: the eval must be a stable yardstick, not a sample
+    # of the selfplay temperature schedule
+    return logits / jnp.maximum(temperature, 1e-6)
 
 
-def make_evaluate_fn(forward, env, config):
+def make_evaluate_fn(forward, value_to_scalar_fn, env, config):
     @jax.pmap
     def evaluate(champions, rng_key, model_config: NNConfig):
         my_player = 0
@@ -747,54 +769,16 @@ def make_evaluate_fn(forward, env, config):
         keys = jax.random.split(subkey, eval_batch_size)
         state = jax.vmap(env.init)(keys)
 
-        opponent_params = jax.tree_util.tree_map(
-            lambda x: jnp.repeat(x, games_per_champ, axis=0),
-            champs_params
-        )
-        opponent_states = jax.tree_util.tree_map(
-            lambda x: jnp.repeat(x, games_per_champ, axis=0),
-            champs_states
-        )
-
-        my_params_batch = jax.tree_util.tree_map(
-            lambda x: jnp.repeat(x[jnp.newaxis, ...], eval_batch_size, axis=0),
-            my_model_params
-        )
-        my_state_batch = jax.tree_util.tree_map(
-            lambda x: jnp.repeat(x[jnp.newaxis, ...], eval_batch_size, axis=0),
-            my_model_state
-        )
-
         def body_fn(val):
             key, state, R, terminated = val
             is_my_turn = (state.current_player == my_player)
 
-            def select_leaf(mask, val_my, val_opp):
-                extra_dims = val_my.ndim - 1
-                for _ in range(extra_dims):
-                    mask = mask[:, jnp.newaxis]
-                return jnp.where(mask, val_my, val_opp)
-
-            active_params = jax.tree_util.tree_map(
-                lambda m, o: select_leaf(is_my_turn, m, o),
-                my_params_batch, opponent_params
+            logits = _value_lookahead_logits(
+                forward, value_to_scalar_fn,
+                my_model_params, my_model_state,
+                champs_params, champs_states,
+                is_my_turn, state, env.num_actions, config.temperature
             )
-            active_state = jax.tree_util.tree_map(
-                lambda m, o: select_leaf(is_my_turn, m, o),
-                my_state_batch, opponent_states
-            )
-
-            (logits, _), _ = jax.vmap(
-                lambda p, s, obs: forward.apply(p, s, obs[jnp.newaxis, ...], is_eval=True)
-            )(active_params, active_state, state.observation)
-
-            if logits is None:
-                logits = jnp.zeros((state.observation.shape[0], env.num_actions), dtype=jnp.float32)
-            else:
-                logits = logits.squeeze(1)
-
-            logits = logits - jnp.max(logits, axis=-1, keepdims=True)
-            logits = jnp.where(state.legal_action_mask, logits, jnp.finfo(logits.dtype).min)
 
             action, key = _sample_action_with_dice(state, key, logits)
             key, subkey2 = jax.random.split(key)
@@ -906,8 +890,7 @@ def main_selfplay():
 
     loss_fn = make_loss_fn(forward, env, config)
     train = make_train_fn(optimizer, loss_fn)
-    evaluate_baseline = make_evaluate_baseline_fn(forward, env, config)
-    evaluate = make_evaluate_fn(forward, env, config)
+    evaluate = make_evaluate_fn(forward, value_to_scalar, env, config)
 
     if jax.process_index() == 0:
         wandb.init(project="pgx-az", config=config.model_dump(), mode='offline')
@@ -948,6 +931,9 @@ def main_selfplay():
     )
 
     champion_pool = [jax.tree_util.tree_map(lambda x: x[0], model)] * config.num_champions
+    # training iteration at which each pool member became a champion ("init" =
+    # the loaded starting checkpoint); parallel to champion_pool, oldest first
+    champion_tags = ["init"] * config.num_champions
 
     start_time = datetime.datetime.now().astimezone() # use local host timezone
     start_time = start_time.strftime("%Y%m%d_%H:%M:%S")
@@ -964,8 +950,10 @@ def main_selfplay():
         if iteration > 0 and iteration % config.new_champion_iters == 0:
             model_0 = jax.tree_util.tree_map(lambda x: x[0], model)
             champion_pool.append(model_0)
+            champion_tags.append(iteration)
             if len(champion_pool) > config.num_champions:
                 champion_pool.pop(0)
+                champion_tags.pop(0)
 
         if iteration % config.eval_interval == 0:
             # Stack champions in the pool
@@ -981,15 +969,27 @@ def main_selfplay():
             keys = jax.random.split(subkey, num_devices)
             model_config = NNConfig(model_params=model[0], model_state=model[1], micro_batch_size=config.micro_batch_size)
             R = evaluate(champions_replicated, keys, model_config)
-            log.update(
-                {
-                    f"now": datetime.datetime.now().astimezone().strftime("%Y%m%d_%H:%M:%S"),
-                    f"eval/vs_champions/avg_R": R.mean().item(),
-                    f"eval/vs_champions/win_rate": ((R > 0).sum() / R.size).item(),
-                    f"eval/vs_champions/draw_rate": ((R == 0).sum() / R.size).item(),
-                    f"eval/vs_champions/lose_rate": ((R < 0).sum() / R.size).item(),
-                }
-            )
+
+            # per-champion breakdown: games are laid out champion-major within
+            # each device, so R (D, k*g) reshapes to (D, k, g); pos0 = oldest
+            # champion, pos{k-1} = newest.  A healthy run shows win_rate
+            # increasing against OLDER champions while staying ~50% vs the
+            # newest one.
+            k = len(champion_pool)
+            games_per_champ = R.shape[-1] // k
+            R_by_champ = numpy.asarray(R).reshape(R.shape[0], k, games_per_champ)
+            champ_log = {
+                f"now": datetime.datetime.now().astimezone().strftime("%Y%m%d_%H:%M:%S"),
+                f"eval/vs_champions/avg_R": R.mean().item(),
+                f"eval/vs_champions/win_rate": ((R > 0).sum() / R.size).item(),
+                f"eval/vs_champions/draw_rate": ((R == 0).sum() / R.size).item(),
+                f"eval/vs_champions/lose_rate": ((R < 0).sum() / R.size).item(),
+            }
+            for pos in range(k):
+                R_c = R_by_champ[:, pos, :]
+                champ_log[f"eval/vs_champions/pos{pos}_win_rate"] = ((R_c > 0).sum() / R_c.size).item()
+                champ_log[f"eval/champions/pos{pos}_iter"] = str(champion_tags[pos])
+            log.update(champ_log)
 
             # Store checkpoints
             if jax.process_index() == 0:
@@ -1036,6 +1036,16 @@ def main_selfplay():
         model_config = NNConfig(model_params=model[0], model_state=model[1], micro_batch_size=config.micro_batch_size)
         data: SelfplayOutput = selfplay(model_config, keys, starting_positions_pool)
         samples: Sample = compute_loss_input(data)
+
+        # selfplay diagnostics: game length and finish rate react to the
+        # temperature schedule and seed mix (high-temperature games finish
+        # faster and more decisively; unfinished games hit max_num_steps)
+        if jax.process_index() == 0:
+            term = numpy.asarray(data.terminated)[0]  # (steps, batch) of device 0
+            first_term = numpy.where(term.any(axis=0), term.argmax(axis=0), -1)
+            finished = first_term >= 0
+            log["selfplay/mean_game_length"] = float(first_term[finished].mean()) if finished.any() else 0.0
+            log["selfplay/unfinished_rate"] = float((~finished).mean())
 
         if jax.process_index() == 0:
             print('  shuffle make minibatches...')
