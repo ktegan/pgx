@@ -130,6 +130,9 @@ def make_nn_evaluator_cls(model: Model):
     forward = model.forward
 
     class NeuralBackgammonEvaluator(pgx.core.Evaluator):
+        # neural forward >> compaction overhead: strategies should skip illegal rows
+        expensive_evaluation = True
+
         def __init__(self, config=None):
             super().__init__(config)
 

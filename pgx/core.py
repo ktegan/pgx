@@ -518,6 +518,13 @@ class OnePlyStrategy(Strategy):
 
 
 class Evaluator(abc.ABC):
+    # Evaluators whose eval() is far more expensive than the compaction
+    # (nonzero + gather + scatter) needed to skip illegal candidate boards
+    # should set this True: the strategies then evaluate only legal rows.
+    # Cheap evaluators (handcrafted weights) keep the dense path, where
+    # evaluating extra rows costs nothing and compaction would dominate.
+    expensive_evaluation: bool = False
+
     def __init__(self, config=None):
         self.config = config
 

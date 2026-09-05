@@ -1169,15 +1169,18 @@ def _evaluate_boards(boards: Array, mask: Array, evaluator, micro_batch_size: Op
     in `boards`, returning equities with unselected entries (mask == False)
     set to -inf.
 
-    With skip_unselected=False (the default) every board is evaluated and the
-    mask is applied afterwards.  With skip_unselected=True only the boards
-    with mask == True are evaluated - for an expensive evaluator such as a
-    neural network this avoids spending compute on illegal candidate boards;
-    the results are identical, up to which boards actually get evaluated.
-    """
+    With skip_unselected=True only boards with mask == True are evaluated -
+    for an expensive evaluator such as a neural network this avoids spending
+    compute on illegal candidate boards.  Skipping actually happens only when
+    the evaluator declares itself worth it (expensive_evaluation=True); with
+    cheap evaluators evaluating extra rows costs nothing while the compaction
+    overhead dominates, so the dense path is kept and the results are
+    identical either way (illegal rows are masked to -inf)."""
     orig_shape = boards.shape[:-1]
     flat_boards = boards.reshape((-1, ALL_GAME_POSITIONS))
     N = flat_boards.shape[0]
+
+    skip_unselected = skip_unselected and getattr(evaluator, "expensive_evaluation", False)
 
     if skip_unselected:
         chunk_size = micro_batch_size if micro_batch_size is not None else 128
@@ -1461,8 +1464,6 @@ class BackgammonTwoPlyChunkedStrategy(core.Strategy):
         eval_2ply = eval_cls(config_2ply)
 
         micro_batch_size = getattr(config, "micro_batch_size", None)
-        if micro_batch_size is None:
-            micro_batch_size = 128
 
         # 1. 1-move evaluation
         one_move_equities = _evaluate_boards(one_move_boards_per_die, one_move_legal_per_die, eval_1ply, micro_batch_size) # shape: (B, 52)
@@ -1481,33 +1482,13 @@ class BackgammonTwoPlyChunkedStrategy(core.Strategy):
             candidate_diffs[:, jnp.newaxis, :, :],                # shape: (B, 1, 52, 28)
         ) # shape: (B, 52, 52, 28)
 
-        flat_two_move_boards = two_move_boards.reshape((-1, ALL_GAME_POSITIONS))
-        flat_legal = two_move_legal_per_die.reshape((-1,))
-        N_flat = flat_legal.shape[0]
-
-        def eval_single(carry):
-            single_board, idx = carry
-            obs = _make_observation(single_board)
-            dummy_state = State(_board=single_board[jnp.newaxis, :], observation=obs[jnp.newaxis, ...])
-
-            # Avoid rebuilding the evaluator class inside vmap
-            return eval_2ply.eval(dummy_state, idx=idx)[0]
-
-        indices, selected_equities = chunked_map(
-            eval_single,
-            (flat_two_move_boards, jnp.arange(N_flat)),
-            flat_legal,
-            chunk_size=micro_batch_size
-        )
-        # chunked_map returns one result per *selected* row (compacted order,
-        # unselected rows reported as index N); scatter them back to their
-        # original flat positions so the (B, 52, 52) reshape stays aligned
-        # with two_move_legal_per_die.  Unselected entries stay 0 and are
-        # masked to -inf below.
-        flat_equities = jnp.zeros(N_flat, dtype=selected_equities.dtype).at[indices].set(selected_equities)
-
-        two_move_equities = flat_equities.reshape((B, 52, 52))
-        two_move_equities = jnp.where(two_move_legal_per_die, two_move_equities, jnp.finfo(two_move_equities.dtype).min)
+        # Same shared evaluation as BackgammonTwoPlyStrategy's 2-ply pass:
+        # dense for cheap evaluators, legal-rows-only (via chunked_map) for
+        # evaluators with expensive_evaluation=True.  Identical results either
+        # way, so the two strategies only differ in their candidate layout.
+        two_move_equities = _evaluate_boards(
+            two_move_boards, two_move_legal_per_die, eval_2ply, micro_batch_size, skip_unselected=True
+        ) # shape: (B, 52, 52), illegal entries -inf
 
         best_second_move_equity = jnp.max(two_move_equities, axis=-1)
         best_two_move_first_action_idx = jnp.argmax(best_second_move_equity, axis=-1) # shape: (B,)
@@ -1613,6 +1594,10 @@ class BackgammonFullTurnStrategy(core.Strategy):
             config = eval_config
         evaluator = eval_cls(config)
         micro_batch_size = getattr(eval_config, "micro_batch_size", None)
+        if micro_batch_size is None:
+            # cheap evaluators take the dense path; batch it so the full
+            # (B, limit) expansion is not materialized at once
+            micro_batch_size = 4096
         return _evaluate_boards(unique_boards, unique_legal, evaluator, micro_batch_size, skip_unselected=True)
 
     def get_next_action_and_equities_batch(self, state: core.State, _rng_key: Array, eval_config, eval_cls) -> tuple:

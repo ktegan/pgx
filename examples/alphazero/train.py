@@ -81,6 +81,9 @@ class NNConfig:
 
 
 class AZNetEvaluator(core.Evaluator):
+    # neural forward >> compaction overhead: strategies should skip illegal rows
+    expensive_evaluation = True
+
     def __init__(self, forward, value_to_scalar_fn, config=None):
         super().__init__(config)
         self.forward = forward
