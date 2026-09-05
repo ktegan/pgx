@@ -836,9 +836,12 @@ def main_selfplay():
         train_policy_network=False,
         values_nodes_at_turn_end=True,
         num_value_channels=6,
-        # collection temperature mix: keep the signal regime dominant while the
-        # value head's spread is still small - 70% of games at <=0.01
-        # (0.001 ~ argmax, 0.01 mostly-best), 30% exploratory slices
+        # --- collection temperature schedule history ---------------------
+        # (comment out superseded schedules, keep them for reference; note
+        # the iteration at which each schedule was first used - iteration 0
+        # of the run resumed from weights ..._00028.pkl)
+        # 2026-09-05, iter 0: first schedule after the flat-head fix (the old
+        #   scalar temperature=0.1 made sampling noise dominate selfplay)
         temperature_schedule=[(0.40, 0.001), (0.30, 0.01), (0.20, 0.1), (0.10, 0.5)],
         # warmup corridors: half argmax, quarters at 0.01 / 0.1 (the
         # uniform-random half is separate, via sval_random_prob)
