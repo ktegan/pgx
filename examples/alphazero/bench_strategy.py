@@ -12,23 +12,22 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-"""Benchmark the backgammon two-ply strategies with a real checkpoint model.
+"""Benchmark the backgammon lookahead strategies with a real checkpoint model.
 
 With the handcrafted SimpleBackgammonEvaluator the strategies are bound by
 cheap numpy-style ops, so inefficiencies are invisible.  With a network from
 checkpoints/ (~1000x more expensive per board, plus batchnorm state) the
 strategy's candidate expansion / chunking / micro-batching choices dominate.
-This harness measures compile time, steady-state latency and peak device
-memory for:
+This harness measures steady-state latency and peak device memory for:
 
-  - BackgammonTwoPlyStrategy          (dense: evaluates every (52 x 52) candidate)
-  - BackgammonTwoPlyChunkedStrategy   (chunked_map over legal candidates)
-
-across micro_batch_size / chunk_size settings, and checks that both strategies
-agree on the selected actions and equities.
+  - BackgammonTwoPlyStrategy     (2-move lookahead, block-deduped candidates)
+  - BackgammonFullTurnStrategy   (adds doubles 3/4-move lookahead)
+  - the 2-ply strategy with an optional top-K 1-ply beam
 
 Each variant runs in its own subprocess so device peak-memory numbers are
 independent (the parent sets XLA_PYTHON_CLIENT_PREALLOCATE=false for children).
+The agreement mode checks the strategy picks stable actions/equities across
+repeated calls (jit determinism sanity check).
 
 Example:
     python examples/alphazero/bench_strategy.py \
@@ -60,10 +59,7 @@ def load_everything(args):
     import pgx
     sys.path.insert(0, HERE)
     from eval import load_model, make_nn_evaluator_cls, NNConfig
-    from pgx.backgammon import (
-        BackgammonTwoPlyStrategy,
-        BackgammonTwoPlyChunkedStrategy,
-    )
+    from pgx.backgammon import BackgammonTwoPlyStrategy
 
     env = pgx.make("backgammon")
     model = load_model(args.checkpoint, env, dtype=jnp.bfloat16)
@@ -155,39 +151,13 @@ def _peak_mib(jax):
     return stats["peak_bytes_in_use"] / (1024 * 1024)
 
 
-@register("nonchunked")
+@register("twoply")
 def _(jax, jnp, env, state, eval_cls, NNConfig, args):
     from pgx.backgammon import BackgammonTwoPlyStrategy
     strategy = BackgammonTwoPlyStrategy(env)
     config = NNConfig(micro_batch_size=args.chunk_sizes[0])
     _, times, _ = _bench_call(jax, strategy, state, config, eval_cls, args.iters)
-    name = "nonchunked" if len(args.chunk_sizes) == 1 else f"nonchunked(c={args.chunk_sizes[0]})"
-    return _report(jax, name, args.batch_size, times)
-
-
-@register("chunked")
-def _(jax, jnp, env, state, eval_cls, NNConfig, args):
-    from pgx.backgammon import BackgammonTwoPlyChunkedStrategy
-    strategy = BackgammonTwoPlyChunkedStrategy(env)
-    config = NNConfig(micro_batch_size=args.chunk_sizes[0])
-    _, times, _ = _bench_call(jax, strategy, state, config, eval_cls, args.iters)
-    return _report(jax, f"chunked(c={args.chunk_sizes[0]})", args.batch_size, times)
-
-
-@register("chunked_static")
-def _(jax, jnp, env, state, eval_cls, NNConfig, args):
-    """Same as 'chunked' but forces the legacy static lax.map() scheduling of
-    chunked_map (the pre-fix behavior) to quantify the dynamic scheduling win."""
-    import functools
-    from pgx._src.utils import chunked_map
-    import pgx.backgammon
-
-    pgx.backgammon.chunked_map = functools.partial(chunked_map, static_schedule=True)
-    from pgx.backgammon import BackgammonTwoPlyChunkedStrategy
-    strategy = BackgammonTwoPlyChunkedStrategy(env)
-    config = NNConfig(micro_batch_size=args.chunk_sizes[0])
-    _, times, _ = _bench_call(jax, strategy, state, config, eval_cls, args.iters)
-    return _report(jax, f"chunked_static(c={args.chunk_sizes[0]})", args.batch_size, times)
+    return _report(jax, f"twoply(c={args.chunk_sizes[0]})", args.batch_size, times)
 
 
 @register("fullturn")
@@ -225,25 +195,22 @@ def _report(jax, name, batch_size, times):
 
 
 def run_agreement(args):
-    """Both strategies must pick the same actions / equities on the same states."""
+    """The 2-ply strategy must pick stable actions / equities across runs
+    (determinism sanity check against jit nondeterminism)."""
     import jax
     import jax.numpy as jnp
-    from pgx.backgammon import BackgammonTwoPlyStrategy, BackgammonTwoPlyChunkedStrategy
+    from pgx.backgammon import BackgammonTwoPlyStrategy
 
     jax, jnp, env, eval_cls, NNConfig = load_everything(args)
     state = make_states(jax, jnp, env, args.batch_size, args.steps, args.seed)
     key = jax.random.PRNGKey(42)
 
-    results = {}
-    for name, cls in [("nonchunked", BackgammonTwoPlyStrategy),
-                      ("chunked", BackgammonTwoPlyChunkedStrategy)]:
-        strategy = cls(env)
-        fn = jax.jit(lambda s, k, st=strategy: st.get_next_action_and_equities_batch(
-            s, k, NNConfig(micro_batch_size=args.chunk_sizes[0]), eval_cls))
-        results[name] = fn(state, key)
+    strategy = BackgammonTwoPlyStrategy(env)
+    fn = jax.jit(lambda s, k: strategy.get_next_action_and_equities_batch(
+        s, k, NNConfig(micro_batch_size=args.chunk_sizes[0]), eval_cls))
+    a0, e0, i0 = fn(state, key)
+    a1, e1, i1 = fn(state, key)
 
-    a0, e0, i0 = results["nonchunked"]
-    a1, e1, i1 = results["chunked"]
     n_action_mismatch = int((a0 != a1).sum())
     n_idx_mismatch = int((i0 != i1).sum())
     eq_diff = float(jnp.abs(jnp.where(jnp.isfinite(e0), e0, 0.0)
@@ -266,7 +233,7 @@ def main():
     parser.add_argument("--chunk-sizes", type=int, nargs="*", default=[128, 256, 512, 1024, 2048])
     parser.add_argument("--top-k", type=int, default=16, help="1-ply beam width for the topk variant")
     parser.add_argument("--seed", type=int, default=0)
-    parser.add_argument("--strategies", nargs="*", default=["nonchunked", "chunked", "agreement"])
+    parser.add_argument("--strategies", nargs="*", default=["twoply", "fullturn", "topk", "agreement"])
     parser.add_argument("--single", default=None, help=argparse.SUPPRESS)
     args = parser.parse_args()
 
@@ -297,7 +264,7 @@ def main():
                 print(out.stderr[-2000:], file=sys.stderr)
                 raise SystemExit("agreement check failed")
             continue
-        if name in ("chunked", "chunked_static", "fullturn", "topk"):
+        if name in ("fullturn", "topk"):
             # one subprocess per chunk size for clean memory numbers
             for c in args.chunk_sizes:
                 all_results[f"{name}(c={c})"] = run_variant(args, name, [c])

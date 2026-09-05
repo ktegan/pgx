@@ -119,8 +119,8 @@ class Model:
 def make_nn_evaluator_cls(model: Model):
     """Build a pgx.core.Evaluator class driven by a loaded checkpoint's value head.
 
-    The pgx two-ply strategies (BackgammonTwoPlyStrategy,
-    BackgammonTwoPlyChunkedStrategy) take an evaluator *class* and construct it
+    The pgx strategies (BackgammonTwoPlyStrategy, BackgammonFullTurnStrategy)
+    take an evaluator *class* and construct it
     with broadcast/sliced configs; instances are then called as
     eval(state, idx=...) where state.observation holds the (B, 24, 1, 12)
     boards to score.  This wrapper adapts a checkpoint's haiku forward to that

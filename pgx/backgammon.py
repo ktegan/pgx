@@ -1292,12 +1292,6 @@ class BackgammonTwoPlyStrategy(core.Strategy):
     Optionally (config.two_ply_top_k in (0, 52)) only the K best first-move
     candidates by 1-ply equity are expanded into second moves, trading a
     little strength for proportionally less 2-ply evaluation.
-
-    Historically this class evaluated the full dense (52 x 52) expansion and
-    BackgammonTwoPlyChunkedStrategy carried a chunked variant; with the
-    shared _evaluate_boards (dense for cheap evaluators, legal-rows-only via
-    chunked_map for expensive ones) and the candidate-block dedup they became
-    the same strategy, so BackgammonTwoPlyChunkedStrategy is now an alias.
     """
 
     @dataclass
@@ -1458,13 +1452,6 @@ class BackgammonTwoPlyStrategy(core.Strategy):
         best_action = _with_dice_roll_action(state, rng_key, res.best_action_nd)
         return best_action, res.candidate_equities, res.candidate_action_indices
 
-
-# The chunked variant predates the shared _evaluate_boards() path: it kept a
-# private chunked_map block to avoid evaluating illegal candidates.  With that
-# logic moved into _evaluate_boards (and gated on evaluator cost) plus the
-# candidate-block dedup, both classes compute identical actions and equities,
-# so the chunked name is kept only for backwards compatibility.
-BackgammonTwoPlyChunkedStrategy = BackgammonTwoPlyStrategy
 
 class BackgammonFullTurnStrategy(core.Strategy):
     LIMIT_2_MOVES = 120

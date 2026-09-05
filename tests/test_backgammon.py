@@ -20,7 +20,6 @@ from pgx.backgammon import (
     SimpleBackgammonEvaluator,
     SimpleBackgammonEvaluatorConfig,
     BackgammonTwoPlyStrategy,
-    BackgammonTwoPlyChunkedStrategy,
     BackgammonFullTurnStrategy,
     ACTION_CHANCE_LENGTH,
     ACTION_MOVE_LENGTH,
@@ -1703,7 +1702,7 @@ def test_strategy_obvious_moves():
     all_tests = starting_move_tests + hit_and_make_home_point_tests + one_move_tests + no_move_tests
     all_boards = jnp.concatenate([test.board for test in all_tests])
 
-    strategy_lst = [BackgammonTwoPlyStrategy(env), BackgammonTwoPlyChunkedStrategy(env), BackgammonFullTurnStrategy(env)]
+    strategy_lst = [BackgammonTwoPlyStrategy(env), BackgammonFullTurnStrategy(env)]
     for strategy in strategy_lst:
         for cur_test in all_tests:
             _run_strategy_test(strategy, cur_test)
@@ -1908,8 +1907,7 @@ def test_is_no_contact():
 
 
 def test_strategy_chunked_vs_standard():
-    """BackgammonTwoPlyChunkedStrategy is an alias of BackgammonTwoPlyStrategy;
-    validate the unified implementation against a brute-force reference that
+    """Validate the 2-ply strategy against a brute-force reference that
     evaluates the full dense (52 x 52) candidate expansion."""
     # Setup some test states
     board_1 = jnp.array(START_POSITIONS, dtype=BOARD_DTYPE)
@@ -1939,21 +1937,18 @@ def test_strategy_chunked_vs_standard():
         SimpleBackgammonEvaluatorConfig(),
     )
 
-    # Evaluate using the (unified) 2-ply strategy
+    # Evaluate using the 2-ply strategy
     strat_std = BackgammonTwoPlyStrategy(env_instance)
     best_action_std, equities_std, candidate_action_indices_std = strat_std.get_next_action_and_equities_batch(
         test_states, jax.random.PRNGKey(0), evaluator_config, SimpleBackgammonEvaluator
     )
 
-    # Evaluate using chunked 2-ply strategy (same class, kept for compat)
-    strat_chk = BackgammonTwoPlyChunkedStrategy(env_instance)
-    best_action_chk, equities_chk, candidate_action_indices_chk = strat_chk.get_next_action_and_equities_batch(
+    # The 2-ply result must be self-consistent when re-run
+    best_action_chk, equities_chk, candidate_action_indices_chk = strat_std.get_next_action_and_equities_batch(
         test_states, jax.random.PRNGKey(0), evaluator_config, SimpleBackgammonEvaluator
     )
-
-    # Assertions
-    assert (best_action_std == best_action_chk).all(), f"Actions mismatch: {best_action_std} vs {best_action_chk}"
-    assert jnp.allclose(equities_std, equities_chk, atol=1e-5, equal_nan=True), f"Equities mismatch: {equities_std} vs {equities_chk}"
+    assert (best_action_std == best_action_chk).all()
+    assert jnp.allclose(equities_std, equities_chk, atol=1e-5, equal_nan=True)
     assert (candidate_action_indices_std == candidate_action_indices_chk).all()
 
     # brute-force reference: dense (52 x 52) evaluation of every candidate pair
@@ -2095,7 +2090,7 @@ def test_strategy_action_at_chance_node():
     evaluator_config = jax.tree_util.tree_map(
         lambda x: jnp.repeat(jnp.expand_dims(x, 0), B, axis=0), SimpleBackgammonEvaluatorConfig()
     )
-    for strategy in [BackgammonTwoPlyStrategy(env), BackgammonTwoPlyChunkedStrategy(env)]:
+    for strategy in [BackgammonTwoPlyStrategy(env)]:
         action = strategy.get_next_action_batch(
             chance_states, jax.random.PRNGKey(2), evaluator_config, SimpleBackgammonEvaluator
         )
@@ -2132,7 +2127,7 @@ def test_strategy_action_at_no_move_node():
     evaluator_config = jax.tree_util.tree_map(
         lambda x: jnp.repeat(jnp.expand_dims(x, 0), B, axis=0), SimpleBackgammonEvaluatorConfig()
     )
-    for strategy in [BackgammonTwoPlyStrategy(env), BackgammonTwoPlyChunkedStrategy(env)]:
+    for strategy in [BackgammonTwoPlyStrategy(env)]:
         action = strategy.get_next_action_batch(
             states, jax.random.PRNGKey(2), evaluator_config, SimpleBackgammonEvaluator
         )

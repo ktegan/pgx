@@ -16,7 +16,7 @@ from pgx.backgammon import BOARD_DTYPE
 from pgx.backgammon import ALL_GAME_POSITIONS
 from pgx.backgammon import PLAYER_CHECKERS
 from pgx.backgammon import HOME_BOARD_LENGTH
-from pydantic import ConfigDict
+from pydantic import BaseModel, field_validator, ConfigDict
 import datetime
 import os
 import pickle
@@ -34,12 +34,12 @@ import pgx
 import wandb
 from omegaconf import OmegaConf
 from pgx.experimental import auto_reset
-from pydantic import BaseModel
+from pydantic import BaseModel, field_validator, ConfigDict
 
 from pgx.models.aznet import AZNet
 from pgx.backgammon import (
     BackgammonTwoPlyStrategy,
-    BackgammonTwoPlyChunkedStrategy,
+    BackgammonFullTurnStrategy,
     SimpleBackgammonEvaluator,
     SimpleBackgammonEvaluatorConfig,
     ACTION_TOTAL_LENGTH,
@@ -108,6 +108,14 @@ class Config(BaseModel):
     model_dtype: str = "bfloat16"
     # selfplay params
     selfplay_batch_size: int = 128
+    strategy_name: str = "fullturn"   # "two_ply" or "fullturn": move-selection strategy for selfplay and pool generation
+
+    @field_validator("strategy_name")
+    @classmethod
+    def _check_strategy_name(cls, v):
+        if v not in ("two_ply", "fullturn"):
+            raise ValueError(f"strategy_name must be 'two_ply' or 'fullturn', got {v!r}")
+        return v
     temperature: float = 0.1     # when this is zero we take the best move every time, higher values increase randomness
     num_simulations: int = 32    # only active if train_policy_network is True
     max_num_steps: int = 1024
@@ -824,12 +832,15 @@ def main_selfplay():
     forward = hk.without_apply_rng(hk.transform_with_state(forward_fn))
     optimizer = optax.adam(learning_rate=config.learning_rate)
 
-    if os.environ['STRAT'] == 'chunk':
-        print("Using chunked strategy")
-        strategy = BackgammonTwoPlyChunkedStrategy(env)
-    else:
-        print("Using normal strategy")
+    # both strategies drive selfplay moves and seed-position generation alike
+    if config.strategy_name == "fullturn":
+        print("Using full turn strategy")
+        strategy = BackgammonFullTurnStrategy(env)
+    elif config.strategy_name == "two_ply":
+        print("Using 2-ply strategy")
         strategy = BackgammonTwoPlyStrategy(env)
+    else:
+        raise ValueError(f"unknown strategy_name: {config.strategy_name!r} (expected 'two_ply' or 'fullturn')")
 
     class AZNetEvaluatorWrapper(AZNetEvaluator):
         def __init__(self, config=None):
