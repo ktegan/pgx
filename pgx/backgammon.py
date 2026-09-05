@@ -15,6 +15,8 @@
 from functools import partial
 from typing import Optional, Tuple, NamedTuple
 
+import dataclasses
+
 import jax
 import jax.numpy as jnp
 
@@ -1104,6 +1106,12 @@ class SimpleBackgammonEvaluatorConfig:
     blots_weight: Array = jnp.float32(0.21)
     bar_weight: Array = jnp.float32(0.28)
     flexibility_weight: Array = jnp.float32(0.61)
+    # two-ply strategies: if 0 (default) expand every legal first-move
+    # candidate into the second move; if K in (0, 52) only the K best
+    # first-move candidates by 1-ply equity are expanded (a beam that trades
+    # a little strength for proportionally less 2-ply evaluation).  Kept as
+    # pytree aux data: it decides evaluation shapes, so it must be static.
+    two_ply_top_k: int = dataclasses.field(default=0, metadata={'pytree_node': False})
 
 
 class SimpleBackgammonEvaluator(core.Evaluator):
@@ -1156,9 +1164,12 @@ def _config_is_batched(config) -> bool:
     across a batch of games).  Strategies must broadcast such configs to
     match their flat evaluation rows, but must NOT broadcast scalar configs:
     SimpleBackgammonEvaluator.get_weight() would mis-index the broadcast
-    leaves with per-row idx values."""
+    leaves with per-row idx values.  Configs can also opt in explicitly with
+    a needs_row_broadcast flag when they carry per-game leaves of their own."""
     if not getattr(config, "should_broadcast", True):
         return False
+    if getattr(config, "needs_row_broadcast", False):
+        return True
     pip_diff_weight = getattr(config, "pip_diff_weight", None)
     return pip_diff_weight is not None and bool(jnp.ndim(pip_diff_weight) > 0)
 
@@ -1265,8 +1276,29 @@ def _with_dice_roll_action(state: core.State, rng_key: Array, best_action: Array
 
 
 class BackgammonTwoPlyStrategy(core.Strategy):
-    CHUNK_SIZE = IN_GAME_POSITIONS // 2
-    NUM_CHUNKS = NUM_DICE * 2
+    """Two-ply lookahead strategy for non-double rolls.
+
+    For every legal first-move candidate the best follow-up (with the other
+    die) is evaluated and the first move of the best sequence is selected.
+    The (52 x 52) candidate matrix only has work in its two off-diagonal
+    blocks (first move with die1/follow-up with die2 and vice versa), and the
+    two blocks describe the SAME final boards with the move order swapped:
+    applying die1-from-i then die2-from-j yields the same board as
+    die2-from-j then die1-from-i.  Only the top-right (die1, die2) block is
+    therefore evaluated and transposed into the bottom-left, halving the
+    second-move evaluations; legality is still applied per block, so an
+    order that is legally unreachable is never selected.
+
+    Optionally (config.two_ply_top_k in (0, 52)) only the K best first-move
+    candidates by 1-ply equity are expanded into second moves, trading a
+    little strength for proportionally less 2-ply evaluation.
+
+    Historically this class evaluated the full dense (52 x 52) expansion and
+    BackgammonTwoPlyChunkedStrategy carried a chunked variant; with the
+    shared _evaluate_boards (dense for cheap evaluators, legal-rows-only via
+    chunked_map for expensive ones) and the candidate-block dedup they became
+    the same strategy, so BackgammonTwoPlyChunkedStrategy is now an alias.
+    """
 
     @dataclass
     class EvaluationDetails:
@@ -1282,8 +1314,6 @@ class BackgammonTwoPlyStrategy(core.Strategy):
 
     def __init__(self, env):
         self.env = env
-        # if this is not true we need to add code to use padding
-        assert self.CHUNK_SIZE * self.NUM_CHUNKS == 2 * SRC_LENGTH
 
     def _evaluate_2ply_details(self, state: core.State, config, eval_cls) -> EvaluationDetails:
         assert state.current_player.ndim == 1, 'state must be a batched state (jax pytree)'
@@ -1298,21 +1328,16 @@ class BackgammonTwoPlyStrategy(core.Strategy):
         candidate_tgt = details.candidate_tgt
         candidate_diffs = details.candidate_diffs
 
-        # Broadcast config to B * 2 * SRC_LENGTH for 1-ply evaluation
-        broad_config = core.broadcast_config(config, 2 * SRC_LENGTH)
-        eval_1ply = eval_cls(broad_config)
-
-        # Broadcast config to B * CHUNK_SIZE * SRC_LENGTH for 2-ply evaluation.
-        # Only broadcast when the config actually carries a batch dimension
-        # (see _config_is_batched): the skip_unselected evaluation below passes
-        # per-row idx to the evaluator, and a scalar config broadcast to
-        # (CHUNK_SIZE * SRC_LENGTH,) rows would be mis-indexed by
-        # SimpleBackgammonEvaluator.get_weight() for games past the first.
+        # Broadcast config to B * 2 * SRC_LENGTH for 1-ply evaluation.  Only
+        # broadcast configs that actually carry a game dimension (see
+        # _config_is_batched): a scalar config broadcast to (2 * SRC_LENGTH,)
+        # would leave get_weight() mis-indexing rows of the (B * 2*SRC_LENGTH)
+        # flat evaluation, while scalar weights need no repetition at all.
         if _config_is_batched(config):
-            config_2ply = core.broadcast_config(config, self.CHUNK_SIZE * SRC_LENGTH)
+            broad_config = core.broadcast_config(config, 2 * SRC_LENGTH)
         else:
-            config_2ply = config
-        eval_2ply = eval_cls(config_2ply)
+            broad_config = config
+        eval_1ply = eval_cls(broad_config)
 
         micro_batch_size = getattr(config, "micro_batch_size", None)
 
@@ -1321,66 +1346,78 @@ class BackgammonTwoPlyStrategy(core.Strategy):
         best_one_move_action_idx = jnp.argmax(one_move_equities, axis=-1) # shape: (B,)
         best_one_move_action = candidate_action_indices[jnp.arange(B), best_one_move_action_idx]
 
-        # Retrieve die indices for lookahead slicing
-        die1_idx = jnp.clip(sorted_dice[:, -1], 1, DICE_SIDES) - 1
-        die2_idx = jnp.clip(sorted_dice[:, -2], 1, DICE_SIDES) - 1
+        boards_tr = _arr_make_new_boards(
+            one_move_boards_per_die[:, :SRC_LENGTH, jnp.newaxis, :],   # (B, 26, 1, 28)
+            candidate_diffs[:, jnp.newaxis, SRC_LENGTH:, :],           # (B, 1, 26, 28)
+        ) # shape: (B, SRC_LENGTH, SRC_LENGTH, 28), die1 move i then die2 move j
 
-        # Extract the relevant 26 actions for chunk_legal and second-move diffs.
-        # Assumptions:
-        # 1. The 52 candidate first-move actions are split into 4 chunks of size 13.
-        # 2. Chunks 0 & 1 correspond to the first 26 actions using die1. Thus, the second 
-        #    move must use die2, which corresponds to the second 26 lookahead diffs/actions (indices 26:52).
-        # 3. Chunks 2 & 3 correspond to the next 26 actions using die2. Thus, the second 
-        #    move must use die1, which corresponds to the first 26 lookahead diffs/actions (indices 0:26).
-        chunk_legal = two_move_legal_per_die.transpose((1, 0, 2)).reshape((self.NUM_CHUNKS, self.CHUNK_SIZE, B, 2 * SRC_LENGTH))
-        chunk_boards = one_move_boards_per_die.transpose((1, 0, 2)).reshape((self.NUM_CHUNKS, self.CHUNK_SIZE, B, ALL_GAME_POSITIONS))
+        legal_tr = two_move_legal_per_die[:, :SRC_LENGTH, SRC_LENGTH:]      # (B, 26, 26)
+        legal_bl = two_move_legal_per_die[:, SRC_LENGTH:, :SRC_LENGTH]      # (B, 26, 26)
 
-        chunk_legal_sliced = jnp.stack([
-            chunk_legal[0, :, :, SRC_LENGTH:SRC_LENGTH * 2],
-            chunk_legal[1, :, :, SRC_LENGTH:SRC_LENGTH * 2],
-            chunk_legal[2, :, :, 0:SRC_LENGTH],
-            chunk_legal[3, :, :, 0:SRC_LENGTH]
-        ], axis=0) # shape: (4, CHUNK_SIZE, B, 26)
+        top_k = int(getattr(config, "two_ply_top_k", 0) or 0)
+        if top_k:
+            # beam: expand only the top_k first-move candidates by 1-ply equity
+            k = min(top_k, 2 * SRC_LENGTH)
+            game_idx = jnp.arange(B)
+            topk_idx = jnp.argsort(-one_move_equities, axis=-1)[:, :k]      # (B, k)
+            topk_boards = one_move_boards_per_die[game_idx[:, jnp.newaxis], topk_idx]  # (B, k, 28)
 
-        chunk_diffs_B = jnp.stack([
-            BOARD_DIFFS_PER_DIE[die2_idx],
-            BOARD_DIFFS_PER_DIE[die2_idx],
-            BOARD_DIFFS_PER_DIE[die1_idx],
-            BOARD_DIFFS_PER_DIE[die1_idx],
-        ], axis=0) # shape: (4, B, 26, 28)
+            # follow-up candidates: the other die's SRC_LENGTH candidates
+            second_is_die2 = topk_idx < SRC_LENGTH                          # first move used die1?
+            sec_base = jnp.where(second_is_die2, SRC_LENGTH, 0)
+            sec_idx = sec_base[:, :, jnp.newaxis] + jnp.arange(SRC_LENGTH)  # (B, k, 26) candidate indices
+            sec_legal = two_move_legal_per_die[game_idx[:, jnp.newaxis, jnp.newaxis],
+                                               topk_idx[:, :, jnp.newaxis],
+                                               sec_idx]                     # (B, k, 26)
+            sec_diffs = candidate_diffs[game_idx[:, jnp.newaxis, jnp.newaxis], sec_idx]  # (B, k, 26, 28)
 
-        def map_fn(inputs):
-            boards, legal, diffs = inputs
+            if _config_is_batched(config):
+                config_2ply = core.broadcast_config(config, k * SRC_LENGTH)
+            else:
+                config_2ply = config
+            eval_2ply = eval_cls(config_2ply)
 
-            two_move_boards = _arr_make_new_boards(
-                boards[:, jnp.newaxis, :, :],
-                diffs.transpose((1, 0, 2))[jnp.newaxis, :, :, :]
+            topk_two_move_boards = _arr_make_new_boards(topk_boards[:, :, jnp.newaxis, :], sec_diffs)
+            topk_equities = _evaluate_boards(topk_two_move_boards, sec_legal, eval_2ply, micro_batch_size, skip_unselected=True)
+
+            best_second_move_equity = jnp.full((B, 2 * SRC_LENGTH), jnp.finfo(one_move_equities.dtype).min)
+            best_second_move_equity = best_second_move_equity.at[game_idx[:, jnp.newaxis], topk_idx].max(topk_equities.max(axis=-1))
+        else:
+            if _config_is_batched(config):
+                config_2ply = core.broadcast_config(config, SRC_LENGTH * SRC_LENGTH)
+            else:
+                config_2ply = config
+            eval_2ply = eval_cls(config_2ply)
+
+            # top-right block: die1 move i, then die2 move j.  Only legal
+            # sequences are evaluated (masked to -inf where illegal).
+            tr_equities = _evaluate_boards(boards_tr, legal_tr, eval_2ply, micro_batch_size, skip_unselected=True)  # (B, 26, 26)
+
+            # bottom-left block: die2 move a, then die1 move j - the same two
+            # single-checker transfers as TR[j, a] in the other order, so when
+            # BOTH orderings are legal the final boards are identical and the
+            # TR equity is reused.  Sequences only legal in this order get
+            # their own boards: reusing the TR board would be wrong because
+            # one_move_boards for an illegal first move is garbage and the
+            # second application's hit fixup would corrupt it.
+            boards_bl = _arr_make_new_boards(
+                one_move_boards_per_die[:, SRC_LENGTH:, jnp.newaxis, :],   # (B, 26, 1, 28)
+                candidate_diffs[:, jnp.newaxis, :SRC_LENGTH, :],           # (B, 1, 26, 28)
+            )
+            mirror_legal = legal_tr.transpose((0, 2, 1))
+            bl_extra = _evaluate_boards(
+                boards_bl, legal_bl & ~mirror_legal, eval_2ply, micro_batch_size, skip_unselected=True
             )
 
-            flat_two_move_boards = two_move_boards.transpose((2, 0, 1, 3)).reshape((B, self.CHUNK_SIZE * SRC_LENGTH, ALL_GAME_POSITIONS))
-            flat_legal = legal.transpose((1, 0, 2)).reshape((B, self.CHUNK_SIZE * SRC_LENGTH))
+            neg_inf = jnp.finfo(tr_equities.dtype).min
+            two_move_equities = jnp.full((B, 2 * SRC_LENGTH, 2 * SRC_LENGTH), neg_inf, dtype=tr_equities.dtype)
+            two_move_equities = two_move_equities.at[:, :SRC_LENGTH, SRC_LENGTH:].set(tr_equities)
+            two_move_equities = two_move_equities.at[:, SRC_LENGTH:, :SRC_LENGTH].set(
+                jnp.where(mirror_legal, tr_equities.transpose((0, 2, 1)), bl_extra)
+            )
 
-            # skip_unselected: with an expensive evaluator (a network loaded
-            # from a checkpoint) most of the CHUNK_SIZE x SRC_LENGTH second
-            # move candidates are illegal and must not be evaluated at all;
-            # the results are identical, only masked rows change from
-            # "evaluated then masked" to "never evaluated".
-            flat_equities = _evaluate_boards(flat_two_move_boards, flat_legal, eval_2ply, micro_batch_size, skip_unselected=True) # shape: (B, self.CHUNK_SIZE * 26)
+            best_second_move_equity = jnp.max(two_move_equities, axis=-1)
 
-            chunk_equities = flat_equities.reshape((B, self.CHUNK_SIZE, SRC_LENGTH)).transpose((1, 0, 2))
-            return chunk_equities
-
-        chunked_equities = jax.lax.map(map_fn, (chunk_boards, chunk_legal_sliced, chunk_diffs_B))
-
-        eq_c0, eq_c1, eq_c2, eq_c3 = chunked_equities[0], chunked_equities[1], chunked_equities[2], chunked_equities[3]
-        minus_inf = jnp.full((self.CHUNK_SIZE, B, SRC_LENGTH), jnp.finfo(eq_c0.dtype).min)
-        eq_c0_full = jnp.concatenate([minus_inf, eq_c0], axis=-1)
-        eq_c1_full = jnp.concatenate([minus_inf, eq_c1], axis=-1)
-        eq_c2_full = jnp.concatenate([eq_c2, minus_inf], axis=-1)
-        eq_c3_full = jnp.concatenate([eq_c3, minus_inf], axis=-1)
-        two_move_equities = jnp.concatenate([eq_c0_full, eq_c1_full, eq_c2_full, eq_c3_full], axis=0).transpose((1, 0, 2))
-
-        best_second_move_equity = jnp.max(two_move_equities, axis=-1)
         best_two_move_first_action_idx = jnp.argmax(best_second_move_equity, axis=-1) # shape: (B,)
         best_two_move_first_action = candidate_action_indices[jnp.arange(B), best_two_move_first_action_idx]
 
@@ -1422,115 +1459,12 @@ class BackgammonTwoPlyStrategy(core.Strategy):
         return best_action, res.candidate_equities, res.candidate_action_indices
 
 
-class BackgammonTwoPlyChunkedStrategy(core.Strategy):
-    @dataclass
-    class EvaluationDetails:
-        one_move_legal_per_die: jnp.ndarray
-        one_move_boards_per_die: jnp.ndarray
-        two_move_legal_per_die: jnp.ndarray
-        candidate_action_indices: jnp.ndarray
-        sorted_dice: jnp.ndarray
-        candidate_tgt: jnp.ndarray
-        candidate_diffs: jnp.ndarray
-        best_action_nd: jnp.ndarray
-        candidate_equities: jnp.ndarray
-
-    def __init__(self, env):
-        self.env = env
-
-    def _evaluate_2ply_details(self, state: core.State, config, eval_cls) -> EvaluationDetails:
-        assert state.current_player.ndim == 1, 'state must be a batched state (jax pytree)'
-        B = state.current_player.shape[0]
-
-        details = jax.vmap(_arr_legal_action_mask_details)(state._board, state._playable_dice)
-        one_move_legal_per_die = details.one_move_legal_per_die
-        one_move_boards_per_die = details.one_move_boards_per_die
-        two_move_legal_per_die = details.two_move_legal_per_die
-        candidate_action_indices = details.candidate_action_indices
-        sorted_dice = details.sorted_dice
-        candidate_tgt = details.candidate_tgt
-        candidate_diffs = details.candidate_diffs
-
-        # Only broadcast config if it contains a batch/game dimension
-        # (see _config_is_batched)
-        if _config_is_batched(config):
-            broad_config = core.broadcast_config(config, 2 * SRC_LENGTH)
-            config_2ply = core.broadcast_config(config, 2 * SRC_LENGTH * 2 * SRC_LENGTH)
-        else:
-            broad_config = config
-            config_2ply = config
-
-        eval_1ply = eval_cls(broad_config)
-        eval_2ply = eval_cls(config_2ply)
-
-        micro_batch_size = getattr(config, "micro_batch_size", None)
-
-        # 1. 1-move evaluation
-        one_move_equities = _evaluate_boards(one_move_boards_per_die, one_move_legal_per_die, eval_1ply, micro_batch_size) # shape: (B, 52)
-        best_one_move_action_idx = jnp.argmax(one_move_equities, axis=-1) # shape: (B,)
-        best_one_move_action = candidate_action_indices[jnp.arange(B), best_one_move_action_idx]
-
-        # 2. 2-move evaluation
-        # The second move candidate j uses the same per-game candidate diffs as
-        # the first move: two_move_legal_per_die[b, i, j] says whether playing
-        # first-move candidate i and then second-move candidate j is legal, and
-        # candidate_diffs[b, j] is the board diff of candidate j.  (Using the
-        # global ONE_MOVE_BOARD_DIFFS here misaligns the (B, 52, 156) expansion
-        # with the (B, 52, 52) legality mask.)
-        two_move_boards = _arr_make_new_boards(
-            one_move_boards_per_die[:, :, jnp.newaxis, :],        # shape: (B, 52, 1, 28)
-            candidate_diffs[:, jnp.newaxis, :, :],                # shape: (B, 1, 52, 28)
-        ) # shape: (B, 52, 52, 28)
-
-        # Same shared evaluation as BackgammonTwoPlyStrategy's 2-ply pass:
-        # dense for cheap evaluators, legal-rows-only (via chunked_map) for
-        # evaluators with expensive_evaluation=True.  Identical results either
-        # way, so the two strategies only differ in their candidate layout.
-        two_move_equities = _evaluate_boards(
-            two_move_boards, two_move_legal_per_die, eval_2ply, micro_batch_size, skip_unselected=True
-        ) # shape: (B, 52, 52), illegal entries -inf
-
-        best_second_move_equity = jnp.max(two_move_equities, axis=-1)
-        best_two_move_first_action_idx = jnp.argmax(best_second_move_equity, axis=-1) # shape: (B,)
-        best_two_move_first_action = candidate_action_indices[jnp.arange(B), best_two_move_first_action_idx]
-
-        has_two_moves_legal = two_move_legal_per_die.any(axis=(-2, -1))
-        has_one_move_legal = one_move_legal_per_die.any(axis=-1)
-
-        best_action_nd = jnp.select([has_two_moves_legal, has_one_move_legal],
-                                    [best_two_move_first_action, best_one_move_action],
-                                    default=NOOP_ACTION_IDX)
-
-        # Determine the correct equity for each candidate action
-        candidate_equities = jnp.where(
-            has_two_moves_legal[:, jnp.newaxis],
-            best_second_move_equity,
-            one_move_equities
-        )
-        legal_mask = jnp.where(
-            has_two_moves_legal[:, jnp.newaxis],
-            two_move_legal_per_die.any(axis=-1),
-            one_move_legal_per_die
-        )
-        candidate_equities = jnp.where(legal_mask, candidate_equities, jnp.finfo(candidate_equities.dtype).min)
-
-        return BackgammonTwoPlyChunkedStrategy.EvaluationDetails(
-            one_move_legal_per_die=one_move_legal_per_die,
-            one_move_boards_per_die=one_move_boards_per_die,
-            two_move_legal_per_die=two_move_legal_per_die,
-            candidate_action_indices=candidate_action_indices,
-            sorted_dice=sorted_dice,
-            candidate_tgt=candidate_tgt,
-            candidate_diffs=candidate_diffs,
-            best_action_nd=best_action_nd,
-            candidate_equities=candidate_equities
-        )
-
-    def get_next_action_and_equities_batch(self, state: core.State, rng_key: Array, config, eval_cls) -> tuple:
-        res = self._evaluate_2ply_details(state, config, eval_cls)
-        best_action = _with_dice_roll_action(state, rng_key, res.best_action_nd)
-        return best_action, res.candidate_equities, res.candidate_action_indices
-
+# The chunked variant predates the shared _evaluate_boards() path: it kept a
+# private chunked_map block to avoid evaluating illegal candidates.  With that
+# logic moved into _evaluate_boards (and gated on evaluator cost) plus the
+# candidate-block dedup, both classes compute identical actions and equities,
+# so the chunked name is kept only for backwards compatibility.
+BackgammonTwoPlyChunkedStrategy = BackgammonTwoPlyStrategy
 
 class BackgammonFullTurnStrategy(core.Strategy):
     LIMIT_2_MOVES = 120
@@ -1597,7 +1531,7 @@ class BackgammonFullTurnStrategy(core.Strategy):
         if micro_batch_size is None:
             # cheap evaluators take the dense path; batch it so the full
             # (B, limit) expansion is not materialized at once
-            micro_batch_size = 4096
+            micro_batch_size = 8192
         return _evaluate_boards(unique_boards, unique_legal, evaluator, micro_batch_size, skip_unselected=True)
 
     def get_next_action_and_equities_batch(self, state: core.State, _rng_key: Array, eval_config, eval_cls) -> tuple:

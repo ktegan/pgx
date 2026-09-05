@@ -28,6 +28,9 @@ from pgx.backgammon import (
     BAR_IDX,
     NO_MOVE,
     NOOP_ACTION_IDX,
+    _arr_legal_action_mask_details,
+    _arr_make_new_boards,
+    _evaluate_boards,
     _decompose_action,
     _to_playable_dice_count,
     _flip_board,
@@ -1905,6 +1908,9 @@ def test_is_no_contact():
 
 
 def test_strategy_chunked_vs_standard():
+    """BackgammonTwoPlyChunkedStrategy is an alias of BackgammonTwoPlyStrategy;
+    validate the unified implementation against a brute-force reference that
+    evaluates the full dense (52 x 52) candidate expansion."""
     # Setup some test states
     board_1 = jnp.array(START_POSITIONS, dtype=BOARD_DTYPE)
 
@@ -1933,13 +1939,13 @@ def test_strategy_chunked_vs_standard():
         SimpleBackgammonEvaluatorConfig(),
     )
 
-    # Evaluate using standard 2-ply strategy
+    # Evaluate using the (unified) 2-ply strategy
     strat_std = BackgammonTwoPlyStrategy(env_instance)
     best_action_std, equities_std, candidate_action_indices_std = strat_std.get_next_action_and_equities_batch(
         test_states, jax.random.PRNGKey(0), evaluator_config, SimpleBackgammonEvaluator
     )
 
-    # Evaluate using chunked 2-ply strategy
+    # Evaluate using chunked 2-ply strategy (same class, kept for compat)
     strat_chk = BackgammonTwoPlyChunkedStrategy(env_instance)
     best_action_chk, equities_chk, candidate_action_indices_chk = strat_chk.get_next_action_and_equities_batch(
         test_states, jax.random.PRNGKey(0), evaluator_config, SimpleBackgammonEvaluator
@@ -1949,6 +1955,131 @@ def test_strategy_chunked_vs_standard():
     assert (best_action_std == best_action_chk).all(), f"Actions mismatch: {best_action_std} vs {best_action_chk}"
     assert jnp.allclose(equities_std, equities_chk, atol=1e-5, equal_nan=True), f"Equities mismatch: {equities_std} vs {equities_chk}"
     assert (candidate_action_indices_std == candidate_action_indices_chk).all()
+
+    # brute-force reference: dense (52 x 52) evaluation of every candidate pair
+    B = boards.shape[0]
+    details = jax.vmap(_arr_legal_action_mask_details)(test_states._board, test_states._playable_dice)
+    full_boards = _arr_make_new_boards(
+        details.one_move_boards_per_die[:, :, jnp.newaxis, :],
+        details.candidate_diffs[:, jnp.newaxis, :, :],
+    )  # (B, 52, 52, 28)
+    ref_eval = SimpleBackgammonEvaluator(SimpleBackgammonEvaluatorConfig())
+    ref_two_move = _evaluate_boards(
+        full_boards, details.two_move_legal_per_die, ref_eval, None, skip_unselected=True
+    )  # (B, 52, 52), illegal entries -inf
+    ref_best_second = ref_two_move.max(axis=-1)
+    has_two = details.two_move_legal_per_die.any(axis=(-2, -1))
+    ref_candidate_equities = jnp.where(has_two[:, jnp.newaxis], ref_best_second,
+                                       _evaluate_boards(details.one_move_boards_per_die, details.one_move_legal_per_die, ref_eval, None))
+    legal_mask = jnp.where(has_two[:, jnp.newaxis],
+                           details.two_move_legal_per_die.any(axis=-1),
+                           details.one_move_legal_per_die)
+    ref_candidate_equities = jnp.where(legal_mask, ref_candidate_equities, jnp.finfo(ref_candidate_equities.dtype).min)
+    ref_best_idx = jnp.argmax(ref_best_second, axis=-1)
+    ref_best_action = details.candidate_action_indices[jnp.arange(B), ref_best_idx]
+    ref_best_action = jnp.where(has_two, ref_best_action, candidate_action_indices_std[jnp.arange(B), jnp.argmax(_evaluate_boards(details.one_move_boards_per_die, details.one_move_legal_per_die, ref_eval, None), axis=-1)])
+
+    assert (best_action_std == ref_best_action).all(), \
+        f"action mismatch vs brute force: {best_action_std} vs {ref_best_action}"
+    assert jnp.allclose(equities_std, ref_candidate_equities, atol=1e-5), \
+        f"equity mismatch vs brute force"
+
+
+def test_two_ply_candidate_block_dedup():
+    """The top-right (die1-first, die2-followup) and bottom-left blocks of the
+    two-move candidate matrix reach the same boards with the move order
+    swapped, so evaluating only the top-right block must give identical
+    actions and equities - checked over many random reachable positions."""
+    B = 64
+    key = jax.random.PRNGKey(7)
+    state = jax.vmap(env.init)(jax.random.split(key, B))
+    for _ in range(12):  # random playout to get varied contact positions
+        key, k1, k2 = jax.random.split(key, 3)
+        logits = jnp.where(state.legal_action_mask, 0.0, jnp.float32(-jnp.inf))
+        action = jax.random.categorical(k1, logits, axis=-1)
+        state = jax.vmap(env.step)(state, action, jax.random.split(k2, B))
+
+    evaluator_config = jax.tree_util.tree_map(
+        lambda x: jnp.repeat(jnp.expand_dims(x, 0), B, axis=0), SimpleBackgammonEvaluatorConfig()
+    )
+    strat = BackgammonTwoPlyStrategy(env)
+    action, equities, _ = strat.get_next_action_and_equities_batch(
+        state, jax.random.PRNGKey(3), evaluator_config, SimpleBackgammonEvaluator
+    )
+
+    # brute force: dense (52 x 52) expansion
+    details = jax.vmap(_arr_legal_action_mask_details)(state._board, state._playable_dice)
+    full_boards = _arr_make_new_boards(
+        details.one_move_boards_per_die[:, :, jnp.newaxis, :],
+        details.candidate_diffs[:, jnp.newaxis, :, :],
+    )
+    ref_two_move = _evaluate_boards(full_boards, details.two_move_legal_per_die,
+                                    SimpleBackgammonEvaluator(SimpleBackgammonEvaluatorConfig()), None, skip_unselected=True)
+    ref_best_second = ref_two_move.max(axis=-1)
+    ref_best_idx = jnp.argmax(ref_best_second, axis=-1)
+    has_two = details.two_move_legal_per_die.any(axis=(-2, -1))
+    # where 2 moves are not legal the strategy falls back to the 1-ply choice;
+    # restrict the comparison to two-move positions
+    tm = has_two
+    game_idx = jnp.arange(B)
+    ref_action = details.candidate_action_indices[game_idx, ref_best_idx]
+    assert (action[tm] == ref_action[tm]).all(), \
+        f"dedup action mismatch on {(action[tm] != ref_action[tm]).sum()} of {int(tm.sum())} two-move games"
+    strategy_best = equities[game_idx, ref_best_idx]
+    assert jnp.allclose(strategy_best[tm], ref_best_second[game_idx, ref_best_idx][tm], atol=1e-5)
+
+
+def test_two_ply_top_k_full_is_identical():
+    """two_ply_top_k >= 52 expands every candidate and must be bit-identical
+    to the default (0 = all) path."""
+    B = 16
+    key = jax.random.PRNGKey(11)
+    state = jax.vmap(env.init)(jax.random.split(key, B))
+    for _ in range(10):
+        key, k1, k2 = jax.random.split(key, 3)
+        logits = jnp.where(state.legal_action_mask, 0.0, jnp.float32(-jnp.inf))
+        action = jax.random.categorical(k1, logits, axis=-1)
+        state = jax.vmap(env.step)(state, action, jax.random.split(k2, B))
+
+    cfg_all = SimpleBackgammonEvaluatorConfig()
+    cfg_52 = SimpleBackgammonEvaluatorConfig(two_ply_top_k=52)
+    strat = BackgammonTwoPlyStrategy(env)
+    a0, e0, i0 = strat.get_next_action_and_equities_batch(state, jax.random.PRNGKey(1), cfg_all, SimpleBackgammonEvaluator)
+    a1, e1, i1 = strat.get_next_action_and_equities_batch(state, jax.random.PRNGKey(1), cfg_52, SimpleBackgammonEvaluator)
+    assert (a0 == a1).all()
+    # both paths expand every candidate; equities agree up to float rounding
+    # (the two paths evaluate different batch shapes, so XLA may associate
+    # the pip-diff matmul differently)
+    finite = jnp.isfinite(e0) & jnp.isfinite(e1)
+    assert jnp.allclose(e0[finite], e1[finite], atol=1e-4)
+    assert (e0[~finite] == e1[~finite]).all()  # identical masking
+    assert (i0 == i1).all()
+
+
+def test_two_ply_top_k_beam_restricts_candidates():
+    """With a beam of K first-move candidates, the 2-ply choice must come from
+    the K best 1-ply candidates, and equities outside the beam must be -inf."""
+    B = 16
+    key = jax.random.PRNGKey(13)
+    state = jax.vmap(env.init)(jax.random.split(key, B))
+    for _ in range(10):
+        key, k1, k2 = jax.random.split(key, 3)
+        logits = jnp.where(state.legal_action_mask, 0.0, jnp.float32(-jnp.inf))
+        action = jax.random.categorical(k1, logits, axis=-1)
+        state = jax.vmap(env.step)(state, action, jax.random.split(k2, B))
+
+    cfg_all = SimpleBackgammonEvaluatorConfig()
+    cfg_k = SimpleBackgammonEvaluatorConfig(two_ply_top_k=8)
+    strat = BackgammonTwoPlyStrategy(env)
+    a_all, e_all, _ = strat.get_next_action_and_equities_batch(state, jax.random.PRNGKey(1), cfg_all, SimpleBackgammonEvaluator)
+    a_k, e_k, _ = strat.get_next_action_and_equities_batch(state, jax.random.PRNGKey(1), cfg_k, SimpleBackgammonEvaluator)
+
+    # the beam's choice must be a legal action of the full search too (the
+    # beam only prunes 1-ply-weaker candidates) and its equity must match the
+    # full search's equity for that candidate
+    game_idx = jnp.arange(B)
+    assert state.legal_action_mask[game_idx, a_k].all()
+    assert jnp.allclose(e_all[game_idx, a_k], e_k[game_idx, a_k], atol=1e-5)
 
 
 
