@@ -82,6 +82,7 @@ class NNConfig:
     and micro_batch_size sizes the strategies' chunked evaluation."""
     micro_batch_size: int = struct.field(pytree_node=False, default=512)
     should_broadcast: bool = struct.field(pytree_node=False, default=False)
+    two_ply_top_k: int = struct.field(pytree_node=False, default=0)
 
 
 def make_value_to_scalar(num_value_channels: int):

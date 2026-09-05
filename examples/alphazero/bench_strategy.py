@@ -94,6 +94,7 @@ def run_variant(args, name, chunk_sizes):
            "--steps", str(args.steps),
            "--iters", str(args.iters),
            "--seed", str(args.seed),
+           "--top-k", str(args.top_k),
            "--chunk-sizes", *[str(c) for c in chunk_sizes],
            "--single", name]
     out = subprocess.run(cmd, env=env, capture_output=True, text=True)
@@ -198,6 +199,17 @@ def _(jax, jnp, env, state, eval_cls, NNConfig, args):
     return _report(jax, f"fullturn(c={args.chunk_sizes[0]})", args.batch_size, times)
 
 
+@register("topk")
+def _(jax, jnp, env, state, eval_cls, NNConfig, args):
+    """2-ply strategy with a top-K 1-ply beam before the second-move
+    expansion (config.two_ply_top_k)."""
+    from pgx.backgammon import BackgammonTwoPlyStrategy
+    strategy = BackgammonTwoPlyStrategy(env)
+    config = NNConfig(micro_batch_size=args.chunk_sizes[0], two_ply_top_k=args.top_k)
+    _, times, _ = _bench_call(jax, strategy, state, config, eval_cls, args.iters)
+    return _report(jax, f"topk(k={args.top_k})", args.batch_size, times)
+
+
 def _report(jax, name, batch_size, times):
     times_ms = sorted(t * 1000 for t in times)
     median = times_ms[len(times_ms) // 2]
@@ -252,6 +264,7 @@ def main():
     parser.add_argument("--steps", type=int, default=40, help="random plies before benchmarking")
     parser.add_argument("--iters", type=int, default=8, help="timed calls per variant")
     parser.add_argument("--chunk-sizes", type=int, nargs="*", default=[128, 256, 512, 1024, 2048])
+    parser.add_argument("--top-k", type=int, default=16, help="1-ply beam width for the topk variant")
     parser.add_argument("--seed", type=int, default=0)
     parser.add_argument("--strategies", nargs="*", default=["nonchunked", "chunked", "agreement"])
     parser.add_argument("--single", default=None, help=argparse.SUPPRESS)
@@ -284,7 +297,7 @@ def main():
                 print(out.stderr[-2000:], file=sys.stderr)
                 raise SystemExit("agreement check failed")
             continue
-        if name in ("chunked", "chunked_static", "fullturn"):
+        if name in ("chunked", "chunked_static", "fullturn", "topk"):
             # one subprocess per chunk size for clean memory numbers
             for c in args.chunk_sizes:
                 all_results[f"{name}(c={c})"] = run_variant(args, name, [c])
