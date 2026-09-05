@@ -1150,6 +1150,19 @@ class SimpleBackgammonEvaluator(core.Evaluator):
         return estimated_equity
 
 
+def _config_is_batched(config) -> bool:
+    """True when an evaluator config carries a per-game batch dimension
+    (eg tournament code replicating SimpleBackgammonEvaluatorConfig weights
+    across a batch of games).  Strategies must broadcast such configs to
+    match their flat evaluation rows, but must NOT broadcast scalar configs:
+    SimpleBackgammonEvaluator.get_weight() would mis-index the broadcast
+    leaves with per-row idx values."""
+    if not getattr(config, "should_broadcast", True):
+        return False
+    pip_diff_weight = getattr(config, "pip_diff_weight", None)
+    return pip_diff_weight is not None and bool(jnp.ndim(pip_diff_weight) > 0)
+
+
 def _evaluate_boards(boards: Array, mask: Array, evaluator, micro_batch_size: Optional[int] = None,
                      skip_unselected: bool = False) -> Array:
     """Evaluate `evaluator` on every board (last dimension ALL_GAME_POSITIONS)
@@ -1288,18 +1301,11 @@ class BackgammonTwoPlyStrategy(core.Strategy):
 
         # Broadcast config to B * CHUNK_SIZE * SRC_LENGTH for 2-ply evaluation.
         # Only broadcast when the config actually carries a batch dimension
-        # (mirrors BackgammonTwoPlyChunkedStrategy): the skip_unselected
-        # evaluation below passes per-row idx to the evaluator, and a scalar
-        # config broadcast to (CHUNK_SIZE * SRC_LENGTH,) rows would be
-        # mis-indexed by SimpleBackgammonEvaluator.get_weight() for games
-        # past the first.
-        is_config_batched = False
-        if getattr(config, "should_broadcast", True):
-            pip_diff_weight = getattr(config, "pip_diff_weight", None)
-            if pip_diff_weight is not None:
-                is_config_batched = jnp.ndim(pip_diff_weight) > 0
-
-        if is_config_batched:
+        # (see _config_is_batched): the skip_unselected evaluation below passes
+        # per-row idx to the evaluator, and a scalar config broadcast to
+        # (CHUNK_SIZE * SRC_LENGTH,) rows would be mis-indexed by
+        # SimpleBackgammonEvaluator.get_weight() for games past the first.
+        if _config_is_batched(config):
             config_2ply = core.broadcast_config(config, self.CHUNK_SIZE * SRC_LENGTH)
         else:
             config_2ply = config
@@ -1443,13 +1449,8 @@ class BackgammonTwoPlyChunkedStrategy(core.Strategy):
         candidate_diffs = details.candidate_diffs
 
         # Only broadcast config if it contains a batch/game dimension
-        is_config_batched = False
-        if getattr(config, "should_broadcast", True):
-            pip_diff_weight = getattr(config, "pip_diff_weight", None)
-            if pip_diff_weight is not None:
-                is_config_batched = jnp.ndim(pip_diff_weight) > 0
-
-        if is_config_batched:
+        # (see _config_is_batched)
+        if _config_is_batched(config):
             broad_config = core.broadcast_config(config, 2 * SRC_LENGTH)
             config_2ply = core.broadcast_config(config, 2 * SRC_LENGTH * 2 * SRC_LENGTH)
         else:
@@ -1559,11 +1560,6 @@ class BackgammonFullTurnStrategy(core.Strategy):
     COMBINATIONS_3_MOVES = 3120
     COMBINATIONS_4_MOVES = 17680
 
-    CHUNK_SIZE_3_MOVES = 10
-    NUM_CHUNKS_3_MOVES = 68
-    CHUNK_SIZE_4_MOVES = 10
-    NUM_CHUNKS_4_MOVES = 306
-
     def __init__(self, env):
         self.env = env
         self.two_ply_strategy = BackgammonTwoPlyStrategy(env)
@@ -1597,42 +1593,27 @@ class BackgammonFullTurnStrategy(core.Strategy):
 
         return unique_boards_next, unique_legal_next, unique_first_move_next
 
-    def _evaluate_unique_boards(self, unique_boards, unique_legal, limit, chunk_size, num_chunks, eval_config, eval_cls):
-        """ evaluate chunks of boards within the unique_boards, stop early when a chunk has no valid boards """
-        B = unique_boards.shape[0]
-        chunk_boards = unique_boards.transpose((1, 0, 2)).reshape((num_chunks, chunk_size, B, ALL_GAME_POSITIONS))
-        chunk_legal = unique_legal.transpose((1, 0)).reshape((num_chunks, chunk_size, B))
+    def _evaluate_unique_boards(self, unique_boards, unique_legal, limit, eval_config, eval_cls):
+        """Evaluate deduplicated boards (B, limit, 28) with legality mask (B, limit).
 
-        evaluator = eval_cls(core.broadcast_config(eval_config, chunk_size))
-
-        init_scores = jnp.full((num_chunks, B, chunk_size), jnp.finfo(jnp.float32).min, dtype=jnp.float32)
-
-        def cond_fn(val):
-            c, _ = val
-            cond_chunks = c < num_chunks
-            safe_c = jnp.minimum(c, num_chunks - 1)
-            cond_legal = chunk_legal[safe_c].any()
-            return cond_chunks & cond_legal
-
-        def body_fn(val):
-            c, scores = val
-            boards = chunk_boards[c]
-            legal = chunk_legal[c]
-
-            flat_boards = boards.transpose((1, 0, 2)).reshape((-1, ALL_GAME_POSITIONS))
-            dummy_state = State(_board=flat_boards)
-            flat_scores = evaluator.eval(dummy_state)
-            scores_chunk = flat_scores.reshape((B, chunk_size))
-            scores_chunk = jnp.where(legal.T, scores_chunk, jnp.finfo(scores_chunk.dtype).min)
-
-            scores = scores.at[c].set(scores_chunk)
-            return c + 1, scores
-
-        _, final_scores = jax.lax.while_loop(cond_fn, body_fn, (0, init_scores))
-
-        scores = final_scores.transpose((1, 0, 2)).reshape((B, limit)) # shape: (B, limit)
-
-        return scores
+        _deduplicate_boards() sorts legal boards to the front, so only the
+        first (per game) n_legal boards need evaluating.  That used to be
+        exploited with a while_loop over fixed chunks of 10 boards with an
+        early stop; the same compaction is now handed to
+        _evaluate_boards(skip_unselected=True), which runs the evaluator in
+        micro_batch_size-wide batches over exactly the legal rows (a dynamic
+        trip count via chunked_map) and builds observations per board, so
+        network evaluators work here too.  Illegal slots score -inf."""
+        if _config_is_batched(eval_config):
+            # per-game weights: broadcast game-major so that the per-row idx
+            # SimpleBackgammonEvaluator.get_weight() slices lands on the
+            # right game's weight
+            config = core.broadcast_config(eval_config, limit)
+        else:
+            config = eval_config
+        evaluator = eval_cls(config)
+        micro_batch_size = getattr(eval_config, "micro_batch_size", None)
+        return _evaluate_boards(unique_boards, unique_legal, evaluator, micro_batch_size, skip_unselected=True)
 
     def get_next_action_and_equities_batch(self, state: core.State, _rng_key: Array, eval_config, eval_cls) -> tuple:
         """ this assumes that state is a jax pytree which has B states """
@@ -1674,7 +1655,7 @@ class BackgammonFullTurnStrategy(core.Strategy):
         # Chunked evaluation for Move 3
         move3_scores = self._evaluate_unique_boards(
             unique_boards_3, unique_legal_3,
-            self.LIMIT_3_MOVES, self.CHUNK_SIZE_3_MOVES, self.NUM_CHUNKS_3_MOVES,
+            self.LIMIT_3_MOVES,
             eval_config, eval_cls
         )
 
@@ -1693,7 +1674,7 @@ class BackgammonFullTurnStrategy(core.Strategy):
         # Chunked evaluation for Move 4
         move4_scores = self._evaluate_unique_boards(
             unique_boards_4, unique_legal_4,
-            self.LIMIT_4_MOVES, self.CHUNK_SIZE_4_MOVES, self.NUM_CHUNKS_4_MOVES,
+            self.LIMIT_4_MOVES,
             eval_config, eval_cls
         )
 

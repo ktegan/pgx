@@ -189,6 +189,15 @@ def _(jax, jnp, env, state, eval_cls, NNConfig, args):
     return _report(jax, f"chunked_static(c={args.chunk_sizes[0]})", args.batch_size, times)
 
 
+@register("fullturn")
+def _(jax, jnp, env, state, eval_cls, NNConfig, args):
+    from pgx.backgammon import BackgammonFullTurnStrategy
+    strategy = BackgammonFullTurnStrategy(env)
+    config = NNConfig(micro_batch_size=args.chunk_sizes[0])
+    _, times, _ = _bench_call(jax, strategy, state, config, eval_cls, args.iters)
+    return _report(jax, f"fullturn(c={args.chunk_sizes[0]})", args.batch_size, times)
+
+
 def _report(jax, name, batch_size, times):
     times_ms = sorted(t * 1000 for t in times)
     median = times_ms[len(times_ms) // 2]
@@ -275,7 +284,7 @@ def main():
                 print(out.stderr[-2000:], file=sys.stderr)
                 raise SystemExit("agreement check failed")
             continue
-        if name in ("chunked", "chunked_static"):
+        if name in ("chunked", "chunked_static", "fullturn"):
             # one subprocess per chunk size for clean memory numbers
             for c in args.chunk_sizes:
                 all_results[f"{name}(c={c})"] = run_variant(args, name, [c])
