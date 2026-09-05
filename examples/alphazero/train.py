@@ -223,7 +223,9 @@ def _generate_back_game_board(rng=None):
 
 
 def gen_and_select_boards(rng_key, env, strategy, min_steps, max_steps, count, selection_fn):
-    batch_size = 8192
+    # per-jit-chunk game count: the fullturn strategy expands each game to up
+    # to 3060 deduplicated boards, so 8192 games per chunk OOMs the GPU
+    batch_size = 1024
     evaluator_config = SimpleBackgammonEvaluatorConfig()
     evaluator_config = jax.tree_util.tree_map(
         lambda x: jnp.repeat(jnp.expand_dims(x, 0), batch_size, axis=0),
