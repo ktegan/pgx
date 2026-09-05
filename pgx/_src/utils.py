@@ -7,14 +7,15 @@ import jax
 import jax.numpy as jnp
 
 
-@jax.jit(static_argnames=('func', 'chunk_size', 'func_uses_is_selected'))
+@jax.jit(static_argnames=('func', 'chunk_size', 'func_uses_is_selected', 'static_schedule'))
 def chunked_map(func:Callable,
                 data:Array,
                 selection:Array,
                 func_args:Optional[List[Array]]=None,
                 func_kwargs:Optional[Dict[str,Array]]=None,
                 chunk_size=64,
-                func_uses_is_selected=False):
+                func_uses_is_selected=False,
+                static_schedule=False):
     """
     This computes idx and func(data[idx]) for every idx where selection[idx] != 0.
     This assumes that selection and data have the same in their first dimension.
@@ -39,6 +40,15 @@ def chunked_map(func:Callable,
             TPUs but will also lead to more func() calls on unselected elements.
         func_uses_is_selected (bool): if True, `func` will receive a second `is_selected`
             argument (a boolean mask for the chunk).
+        static_schedule (bool): if True, iterate over ALL padded_data_len / chunk_size
+            chunks with a static lax.map() and short-circuit fully unselected chunks
+            with a lax.cond().  If False (the default), only the first
+            ceil(n_selected / chunk_size) chunks are scheduled via a while_loop with a
+            dynamic trip count.  jnp.nonzero() compacts the selected indices at the
+            front, so every chunk after those is guaranteed to be fully unselected and
+            only ever produced zeros - for an expensive func() (eg a neural network
+            forward) statically scheduling them is pure loop overhead.  The two modes
+            return identical results.
 
         Returns:
             (Array, Array): returns a pair of arrays, the first array
@@ -110,28 +120,67 @@ def chunked_map(func:Callable,
             process_lambda    = lambda: vmap_func(cur_data, *func_args)
         return jax.lax.cond(any_selected, process_lambda, lambda: zero_out_chunk)
 
-    # Call jax.lax.map() to iterate through chunks and call a vmap'ed version of
-    # func to process all rows within a chunk in parallel.
-    #
-    # If instead of map() we used vmap() below that would make this chunking
-    # useless.  If we used vmap() the jax.lax.cond() condition in process_chunk()
-    # would have no value because both branches would have to be evaluated.
-    # All threads have to stay in lock step when using vmap() (hardware branch
-    # divergence), so if we want to short-circuit an entire chunk of unselected
-    # data we should use jax.lax.map().
-    results = jax.lax.map(process_chunk, (chunked_selection_indices, chunked_data))
+    if static_schedule:
+        # Call jax.lax.map() to iterate through chunks and call a vmap'ed version of
+        # func to process all rows within a chunk in parallel.
+        #
+        # If instead of map() we used vmap() below that would make this chunking
+        # useless.  If we used vmap() the jax.lax.cond() condition in process_chunk()
+        # would have no value because both branches would have to be evaluated.
+        # All threads have to stay in lock step when using vmap() (hardware branch
+        # divergence), so if we want to short-circuit an entire chunk of unselected
+        # data we should use jax.lax.map().
+        results = jax.lax.map(process_chunk, (chunked_selection_indices, chunked_data))
 
-    # reshape the output so that it is no longer in chunks and trim to the original length
-    def reshape_chunked_results(out_src):
-        return out_src.reshape(padded_data_len, *out_src.shape[2:])
-    results = jax.tree_util.tree_map(reshape_chunked_results, results)
+        # reshape the output so that it is no longer in chunks and trim to the original length
+        def reshape_chunked_results(out_src):
+            return out_src.reshape(padded_data_len, *out_src.shape[2:])
+        results = jax.tree_util.tree_map(reshape_chunked_results, results)
+
+        def trim_to_size_N(data_src):
+            return data_src[:N]
+
+        return trim_to_size_N(selection_indices), jax.tree_util.tree_map(trim_to_size_N, results)
+
+    # Dynamic scheduling: only the first ceil(n_selected / chunk_size) chunks
+    # contain selected rows (jnp.nonzero() compacts them at the front), so
+    # schedule just those with a while_loop; trailing chunks are skipped
+    # entirely and their rows stay zero, which is exactly what the
+    # short-circuited lax.cond() branch above produced for them.
+    def create_zero_results(out_src):
+        return jnp.zeros((padded_data_len, *out_src.shape[1:]), dtype=out_src.dtype)
+    results = jax.tree_util.tree_map(create_zero_results, sample_out_chunk)
+
+    n_selected      = jnp.count_nonzero(padded_selection)
+    num_real_chunks = (n_selected + chunk_size - 1) // chunk_size
+
+    def cond(carry):
+        i, _results = carry
+        return i < num_real_chunks
+
+    def body(carry):
+        i, cur_results = carry
+        cur_indices    = chunked_selection_indices[i]
+        cur_data       = jax.tree_util.tree_map(lambda src: src[i], chunked_data)
+        is_selected    = cur_indices != N
+        if func_uses_is_selected:
+            out_chunk = vmap_func(cur_data, is_selected, *func_args)
+        else:
+            out_chunk = vmap_func(cur_data, *func_args)
+
+        def insert_chunk(dst, src):
+            start = [i * chunk_size] + [jnp.int32(0)] * (src.ndim - 1)
+            return jax.lax.dynamic_update_slice(dst, src.astype(dst.dtype), start)
+
+        cur_results = jax.tree_util.tree_map(insert_chunk, cur_results, out_chunk)
+        return i + 1, cur_results
+
+    _i, results = jax.lax.while_loop(cond, body, (jnp.int32(0), results))
 
     def trim_to_size_N(data_src):
         return data_src[:N]
 
     return trim_to_size_N(selection_indices), jax.tree_util.tree_map(trim_to_size_N, results)
-
-
 
 
 def _download(url, filename):

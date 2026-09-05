@@ -170,3 +170,41 @@ def test_chunked_map_selection():
     assert (result[3]  == sum_10_plus_args1 + 500)
     assert (result[48] == sum_10_plus_args1 + 9600)
     assert (result[49] == sum_10_plus_args1 + 9700)
+
+
+def test_chunked_map_dynamic_matches_static():
+    """ The default dynamic scheduling (while_loop over only the chunks that
+    contain selected rows) must return bit-identical results to the legacy
+    static lax.map() scheduling, for sparse, dense and empty selections and
+    for both values of func_uses_is_selected.  Sparse selections are the case
+    static scheduling is slowest for: it walks every chunk regardless. """
+    for func_uses_is_selected in [False, True]:
+        for chunk_size in [1, 7, 64, 128]:
+            for selection_mode in ["sparse", "dense", "empty", "single"]:
+                N = 500
+                data = jnp.arange(2 * N, dtype=jnp.int32).reshape((N, 2)) - 3
+
+                if selection_mode == "sparse":
+                    sel_rows = jnp.array([3, 17, 18, 199, 200, 201, 471, 499])
+                    selection = jnp.zeros(N, dtype=jnp.bool_).at[sel_rows].set(True)
+                elif selection_mode == "dense":
+                    selection = jnp.ones(N, dtype=jnp.bool_)
+                elif selection_mode == "empty":
+                    selection = jnp.zeros(N, dtype=jnp.bool_)
+                else:  # single selected row at the very end
+                    selection = jnp.zeros(N, dtype=jnp.bool_).at[N - 1].set(True)
+
+                def func(row, is_selected=None):
+                    if func_uses_is_selected:
+                        return jax.lax.cond(is_selected, lambda: row.sum().astype(jnp.float32), lambda: -1.0)
+                    return row.sum().astype(jnp.float32)
+
+                static_indices, static_result = chunked_map(
+                    func, data, selection, chunk_size=chunk_size,
+                    func_uses_is_selected=func_uses_is_selected, static_schedule=True)
+                dyn_indices, dyn_result = chunked_map(
+                    func, data, selection, chunk_size=chunk_size,
+                    func_uses_is_selected=func_uses_is_selected, static_schedule=False)
+
+                assert (static_indices == dyn_indices).all()
+                assert (static_result == dyn_result).all()
