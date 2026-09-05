@@ -124,13 +124,12 @@ class Config(BaseModel):
     @field_validator("temperature_schedule")
     @classmethod
     def _check_temperature_schedule(cls, v):
-        if v is None:
-            return v
-        if abs(sum(f for f, _ in v) - 1.0) > 1e-6:
-            raise ValueError(f"temperature_schedule fractions must sum to 1, got {v}")
-        if any(t < 0 for _, t in v):
-            raise ValueError(f"temperature_schedule temperatures must be >= 0, got {v}")
-        return v
+        return _validate_temperature_schedule(v, "temperature_schedule")
+
+    @field_validator("sval_temperature_schedule")
+    @classmethod
+    def _check_sval_temperature_schedule(cls, v):
+        return _validate_temperature_schedule(v, "sval_temperature_schedule")
     temperature: float = 0.1     # when this is zero we take the best move every time, higher values increase randomness
     # per-game temperature mix: [(fraction, temperature), ...], fractions sum to 1.
     # Each game draws its temperature once (fixed for the whole game) - low
@@ -138,6 +137,8 @@ class Config(BaseModel):
     # games explore lower-equity continuations.  None = use `temperature` for
     # every game.
     temperature_schedule: Optional[List[Tuple[float, float]]] = None
+    # eval/vs_champions is a yardstick, not training data: default 0 = argmax
+    eval_temperature: float = 0.0
     num_simulations: int = 32    # only active if train_policy_network is True
     max_num_steps: int = 1024
     # training params
@@ -150,9 +151,13 @@ class Config(BaseModel):
     checkpoint_base_path: str = "checkpoints/selfplay"
     train_policy_network: bool = True
     values_nodes_at_turn_end: bool = False
-    sval_max_steps: int = 50
+    sval_max_steps: int = 100
     sval_custom_max_steps: int = 3
-    sval_random_prob: float = 0.5   # fraction of SVAL warmup games acted with uniform-random legal moves instead of greedy (off-corridor position diversity)
+    sval_random_prob: float = 0.5   # fraction of SVAL warmup games acted with uniform-random legal moves instead of strategy moves (off-corridor position diversity)
+    # SVAL warmup strategy-move temperature: 0 = greedy argmax.  Per-game schedule
+    # works like temperature_schedule (drawn once per game, fixed for the warmup)
+    sval_temperature: float = 0.0
+    sval_temperature_schedule: Optional[List[Tuple[float, float]]] = None
     num_champions: int = 4
     new_champion_iters: int = 5
     micro_batch_size: Optional[int] = 8192
@@ -165,6 +170,16 @@ class Config(BaseModel):
     race_num_moves: int = 150
 
     model_config = ConfigDict(extra='forbid')
+
+
+def _validate_temperature_schedule(v, field_name):
+    if v is None:
+        return v
+    if abs(sum(f for f, _ in v) - 1.0) > 1e-6:
+        raise ValueError(f"{field_name} fractions must sum to 1, got {v}")
+    if any(t < 0 for _, t in v):
+        raise ValueError(f"{field_name} temperatures must be >= 0, got {v}")
+    return v
 
 
 def _generate_back_game_board(rng=None):
@@ -528,6 +543,18 @@ def make_selfplay_fn(forward, value_to_scalar_fn, env, config, strategy, eval_cl
         else:
             game_temperatures = config.temperature
 
+        # per-game SVAL warmup temperature: drawn once per game (like the
+        # collection temperature) so warmup corridors vary between greedy
+        # (t=0), near-greedy and exploratory - on top of the random-move
+        # games chosen by sval_random_prob
+        if config.sval_temperature_schedule is not None:
+            sval_fractions = jnp.array([f for f, _ in config.sval_temperature_schedule])
+            key_temp, rng_key = jax.random.split(rng_key)
+            sval_idx = jax.random.categorical(key_temp, jnp.log(sval_fractions), axis=-1, shape=(batch_size,))
+            sval_game_temperatures = jnp.array([t for _, t in config.sval_temperature_schedule])[sval_idx]
+        else:
+            sval_game_temperatures = config.sval_temperature
+
         # this is a simplified version of Apply Self-Supervised Value Alignment (SVAL)
         # where we warmup all games within the batch by a number of randomly chosen steps based on position type
         max_warmup_steps = max(config.sval_max_steps, config.sval_custom_max_steps)
@@ -552,8 +579,11 @@ def make_selfplay_fn(forward, value_to_scalar_fn, env, config, strategy, eval_cl
                 state_carry, key_carry = carry
                 key_act, key_rand, key_reset, key_next = jax.random.split(key_carry, 4)
 
-                # greedy: the lookahead strategy with the neural network evaluator
-                strategy_action = strategy.get_next_action_batch(state_carry, key_act, model_config, eval_cls)
+                # strategy moves at the game's warmup temperature (0 = argmax);
+                # chance nodes roll from the true dice odds inside
+                strategy_action, _, _ = strategy_action_and_weights(
+                    state_carry, key_act, strategy, model_config, eval_cls, sval_game_temperatures
+                )
 
                 # random: uniform over legal moves; at chance nodes the roll
                 # is sampled from the true dice odds
@@ -746,8 +776,8 @@ def _value_lookahead_logits(forward, value_to_scalar_fn, my_params, my_state, op
     logits = logits.at[game_range, NOOP_ACTION_IDX].set(
         jnp.where(legal.any(axis=-1), jnp.float32(-jnp.inf), jnp.float32(0.0))
     )
-    # fixed low temperature: the eval must be a stable yardstick, not a sample
-    # of the selfplay temperature schedule
+    # argmax by default (eval_temperature=0): the eval is a yardstick, not a
+    # sample of the selfplay temperature schedule
     return logits / jnp.maximum(temperature, 1e-6)
 
 
@@ -777,7 +807,7 @@ def make_evaluate_fn(forward, value_to_scalar_fn, env, config):
                 forward, value_to_scalar_fn,
                 my_model_params, my_model_state,
                 champs_params, champs_states,
-                is_my_turn, state, env.num_actions, config.temperature
+                is_my_turn, state, env.num_actions, config.eval_temperature
             )
 
             action, key = _sample_action_with_dice(state, key, logits)
@@ -806,6 +836,13 @@ def main_selfplay():
         train_policy_network=False,
         values_nodes_at_turn_end=True,
         num_value_channels=6,
+        # collection temperature mix: keep the signal regime dominant while the
+        # value head's spread is still small - 70% of games at <=0.01
+        # (0.001 ~ argmax, 0.01 mostly-best), 30% exploratory slices
+        temperature_schedule=[(0.40, 0.001), (0.30, 0.01), (0.20, 0.1), (0.10, 0.5)],
+        # warmup corridors: half argmax, quarters at 0.01 / 0.1 (the
+        # uniform-random half is separate, via sval_random_prob)
+        sval_temperature_schedule=[(0.5, 0.0), (0.25, 0.01), (0.25, 0.1)],
         #selfplay_batch_size=8,
         load_checkpoint_path='checkpoints/selfplay_20260902_19:26:54_00028.pkl',
         #load_checkpoint_path='checkpoints/distill_20260702_16:06:35_03000.pkl',
