@@ -86,7 +86,7 @@ class AZNetEvaluator(core.Evaluator):
         self.forward = forward
         self.value_to_scalar_fn = value_to_scalar_fn
 
-    def eval(self, state: pgx.State) -> jnp.ndarray:
+    def eval(self, state: pgx.State, idx=None) -> jnp.ndarray:
         (logits, value), _ = self.forward.apply(
             self.config.model_params, self.config.model_state, state.observation, is_eval=True
         )
@@ -758,7 +758,8 @@ def main_selfplay():
         values_nodes_at_turn_end=True,
         num_value_channels=6,
         #selfplay_batch_size=8,
-        load_checkpoint_path='checkpoints/distill_20260702_16:06:35_03000.pkl',
+        load_checkpoint_path='checkpoints/selfplay_20260902_19:26:54_00028.pkl',
+        #load_checkpoint_path='checkpoints/distill_20260702_16:06:35_03000.pkl',
         #load_checkpoint_path='checkpoints/selfplay_20260703_17:33:28_00035.pkl',
         #load_checkpoint_path='checkpoints/selfplay_20260704_11:32:50_00008.pkl',
         #load_checkpoint_path='checkpoints/selfplay_20260705_21:11:04_00033.pkl',
