@@ -1150,10 +1150,43 @@ class SimpleBackgammonEvaluator(core.Evaluator):
         return estimated_equity
 
 
-def _evaluate_boards(boards: Array, mask: Array, evaluator, micro_batch_size: Optional[int] = None) -> Array:
+def _evaluate_boards(boards: Array, mask: Array, evaluator, micro_batch_size: Optional[int] = None,
+                     skip_unselected: bool = False) -> Array:
+    """Evaluate `evaluator` on every board (last dimension ALL_GAME_POSITIONS)
+    in `boards`, returning equities with unselected entries (mask == False)
+    set to -inf.
+
+    With skip_unselected=False (the default) every board is evaluated and the
+    mask is applied afterwards.  With skip_unselected=True only the boards
+    with mask == True are evaluated - for an expensive evaluator such as a
+    neural network this avoids spending compute on illegal candidate boards;
+    the results are identical, up to which boards actually get evaluated.
+    """
     orig_shape = boards.shape[:-1]
     flat_boards = boards.reshape((-1, ALL_GAME_POSITIONS))
     N = flat_boards.shape[0]
+
+    if skip_unselected:
+        chunk_size = micro_batch_size if micro_batch_size is not None else 128
+
+        def eval_single(carry):
+            single_board, idx = carry
+            obs = _make_observation(single_board)
+            dummy_state = State(_board=single_board[jnp.newaxis, :], observation=obs[jnp.newaxis, ...])
+            return evaluator.eval(dummy_state, idx=idx)[0]
+
+        indices, selected_equities = chunked_map(
+            eval_single,
+            (flat_boards, jnp.arange(N)),
+            mask.reshape((-1,)),
+            chunk_size=chunk_size
+        )
+        # chunked_map returns one result per selected row (compacted order);
+        # scatter them back to their original flat positions.  Unselected
+        # entries stay 0 and are masked to -inf below.
+        flat_equities = jnp.zeros(N, dtype=selected_equities.dtype).at[indices].set(selected_equities)
+        equities = flat_equities.reshape(orig_shape)
+        return jnp.where(mask, equities, jnp.finfo(equities.dtype).min)
 
     if micro_batch_size is not None and N > micro_batch_size:
         num_micro_batches = (N + micro_batch_size - 1) // micro_batch_size
@@ -1253,8 +1286,23 @@ class BackgammonTwoPlyStrategy(core.Strategy):
         broad_config = core.broadcast_config(config, 2 * SRC_LENGTH)
         eval_1ply = eval_cls(broad_config)
 
-        # Broadcast config to B * CHUNK_SIZE * SRC_LENGTH for 2-ply evaluation
-        config_2ply = core.broadcast_config(config, self.CHUNK_SIZE * SRC_LENGTH)
+        # Broadcast config to B * CHUNK_SIZE * SRC_LENGTH for 2-ply evaluation.
+        # Only broadcast when the config actually carries a batch dimension
+        # (mirrors BackgammonTwoPlyChunkedStrategy): the skip_unselected
+        # evaluation below passes per-row idx to the evaluator, and a scalar
+        # config broadcast to (CHUNK_SIZE * SRC_LENGTH,) rows would be
+        # mis-indexed by SimpleBackgammonEvaluator.get_weight() for games
+        # past the first.
+        is_config_batched = False
+        if getattr(config, "should_broadcast", True):
+            pip_diff_weight = getattr(config, "pip_diff_weight", None)
+            if pip_diff_weight is not None:
+                is_config_batched = jnp.ndim(pip_diff_weight) > 0
+
+        if is_config_batched:
+            config_2ply = core.broadcast_config(config, self.CHUNK_SIZE * SRC_LENGTH)
+        else:
+            config_2ply = config
         eval_2ply = eval_cls(config_2ply)
 
         micro_batch_size = getattr(config, "micro_batch_size", None)
@@ -1303,7 +1351,12 @@ class BackgammonTwoPlyStrategy(core.Strategy):
             flat_two_move_boards = two_move_boards.transpose((2, 0, 1, 3)).reshape((B, self.CHUNK_SIZE * SRC_LENGTH, ALL_GAME_POSITIONS))
             flat_legal = legal.transpose((1, 0, 2)).reshape((B, self.CHUNK_SIZE * SRC_LENGTH))
 
-            flat_equities = _evaluate_boards(flat_two_move_boards, flat_legal, eval_2ply, micro_batch_size) # shape: (B, self.CHUNK_SIZE * 26)
+            # skip_unselected: with an expensive evaluator (a network loaded
+            # from a checkpoint) most of the CHUNK_SIZE x SRC_LENGTH second
+            # move candidates are illegal and must not be evaluated at all;
+            # the results are identical, only masked rows change from
+            # "evaluated then masked" to "never evaluated".
+            flat_equities = _evaluate_boards(flat_two_move_boards, flat_legal, eval_2ply, micro_batch_size, skip_unselected=True) # shape: (B, self.CHUNK_SIZE * 26)
 
             chunk_equities = flat_equities.reshape((B, self.CHUNK_SIZE, SRC_LENGTH)).transpose((1, 0, 2))
             return chunk_equities

@@ -1715,7 +1715,7 @@ def test_strategy_full_move():
         def __init__(self, config):
             super().__init__(config)
 
-        def eval(self, state: State) -> Array:
+        def eval(self, state: State, idx=None) -> Array:
             # create a reward that would require looking 4 moves ahead to discover,
             # if you only look two moves ahead you would move one checker from 7 to 9,
             # then you would move 13 to 15
