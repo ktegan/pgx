@@ -22,7 +22,7 @@ import os
 import pickle
 import time
 from functools import partial
-from typing import NamedTuple, ClassVar, Optional
+from typing import NamedTuple, ClassVar, Optional, List, Tuple
 
 import haiku as hk
 import jax
@@ -116,7 +116,24 @@ class Config(BaseModel):
         if v not in ("two_ply", "fullturn"):
             raise ValueError(f"strategy_name must be 'two_ply' or 'fullturn', got {v!r}")
         return v
+
+    @field_validator("temperature_schedule")
+    @classmethod
+    def _check_temperature_schedule(cls, v):
+        if v is None:
+            return v
+        if abs(sum(f for f, _ in v) - 1.0) > 1e-6:
+            raise ValueError(f"temperature_schedule fractions must sum to 1, got {v}")
+        if any(t < 0 for _, t in v):
+            raise ValueError(f"temperature_schedule temperatures must be >= 0, got {v}")
+        return v
     temperature: float = 0.1     # when this is zero we take the best move every time, higher values increase randomness
+    # per-game temperature mix: [(fraction, temperature), ...], fractions sum to 1.
+    # Each game draws its temperature once (fixed for the whole game) - low
+    # temperature games give predictable high-quality moves, high temperature
+    # games explore lower-equity continuations.  None = use `temperature` for
+    # every game.
+    temperature_schedule: Optional[List[Tuple[float, float]]] = None
     num_simulations: int = 32    # only active if train_policy_network is True
     max_num_steps: int = 1024
     # training params
@@ -131,11 +148,13 @@ class Config(BaseModel):
     values_nodes_at_turn_end: bool = False
     sval_max_steps: int = 50
     sval_custom_max_steps: int = 3
+    sval_random_prob: float = 0.5   # fraction of SVAL warmup games acted with uniform-random legal moves instead of greedy (off-corridor position diversity)
     num_champions: int = 4
     new_champion_iters: int = 5
     micro_batch_size: Optional[int] = 8192
-    seed_backgame_prob: float = 0.05
-    seed_blitz_prob: float = 0.05
+    # seed-position pool mix (sums <= 1; the remainder plays the canonical opening)
+    seed_backgame_prob: float = 0.10
+    seed_blitz_prob: float = 0.10
     seed_race_prob: float = 0.00
     blitz_min_steps: int = 20    # a step is moving one checker and/or re-rolling dice, both players completing a turn usually takes 6 steps
     blitz_max_steps: int = 30
@@ -144,51 +163,43 @@ class Config(BaseModel):
     model_config = ConfigDict(extra='forbid')
 
 
-def _generate_back_game_board() -> Array:
+def _generate_back_game_board(rng=None):
+    """Random reachable back-game position: black has anchors deep in white's
+    home board plus checkers scattered through the outer boards, white holds
+    the rest of the board (including its home).  Everything is one uniform
+    random composition of 15 checkers per side, so no structure is
+    over-represented and no side is ever over-strength."""
+    rng = rng if rng is not None else numpy.random
     board = numpy.zeros(ALL_GAME_POSITIONS, dtype=BOARD_DTYPE)
 
-    # 1. Randomly select 1 to 3 board positions within the first 5 board positions (0 to 4)
-    num_anchors = int(numpy.random.choice([1, 2, 3], p=[1/3, 1/3, 1/3]))
-    anchor_positions = numpy.random.choice(5, size=num_anchors, replace=False)
-    for pos in anchor_positions:
-        board[pos] = int(numpy.random.choice([1, 2, 3], p=[1/3, 1/3, 1/3]))
+    # black: 1-3 anchors in white's home (points 0-4), the rest of the checkers
+    # split uniformly over points 16-22
+    num_anchors = int(rng.choice([1, 2, 3]))
+    anchor_points = rng.choice(5, size=num_anchors, replace=False)
+    for pos in anchor_points:
+        board[pos] = int(rng.choice([1, 2, 3]))
+    black_anchor_total = int(board[:5].sum())
+    front_positions = rng.choice(7, size=PLAYER_CHECKERS - black_anchor_total, replace=True) + 16
+    for pos in front_positions:
+        board[pos] += 1
 
-    # 2. Assign black checkers to positions 16 through 22
-    for pos in range(16, 23):
-        board[pos] = int(numpy.random.choice([0, 1, 2, 3], p=[0.2, 0.1, 0.5, 0.2]))
+    # white: all points not occupied by black anchors are available; pick how
+    # many points white holds (4..15), place one checker on each, then spread
+    # the rest.  Extra white checkers go on points 5-11, keeping white's deep
+    # home board sparse so black's anchors can still be hit out.
+    free_points = [p for p in range(BOARD_LENGTH) if board[p] == 0]
+    num_white_points = int(rng.choice(range(4, min(len(free_points), PLAYER_CHECKERS) + 1)))
+    white_points = rng.choice(free_points, size=num_white_points, replace=False)
+    for p in white_points:
+        board[p] = -1
+    spill_points = [p for p in white_points if p >= 5] or list(white_points)
+    white_left = PLAYER_CHECKERS - num_white_points
+    while white_left > 0:
+        board[int(rng.choice(spill_points))] -= 1
+        white_left -= 1
 
-    # 3. Adjust black checkers to exactly 15
-    total_black = board.sum()
-    if total_black > PLAYER_CHECKERS:
-        while board.sum() > PLAYER_CHECKERS:
-            pos = int(numpy.random.randint(0, BOARD_LENGTH))
-            if board[pos] > 0:
-                board[pos] -= 1
-    elif total_black < PLAYER_CHECKERS:
-        while board.sum() < PLAYER_CHECKERS:
-            pos = int(numpy.random.randint(0, BOARD_LENGTH))
-            board[pos] += 1
-
-    # 4. Add white checkers (negative values)
-    # For white checkers from board position starting at 0 if there are no black checkers, add white checkers
-    for pos in range(24):
-        if board[pos] == 0:
-            num_white = int(numpy.random.choice([0, 1, 2, 3], p=[0.2, 0.1, 0.5, 0.2]))
-            current_white = -int(board[board < 0].sum())
-            if current_white + num_white > PLAYER_CHECKERS:
-                num_white = PLAYER_CHECKERS - current_white
-            board[pos] = -num_white
-            if -board[board < 0].sum() == PLAYER_CHECKERS:
-                break
-
-    # If white has less than 15 checkers, randomly add white checkers where there are no black checkers
-    current_white = -int(board[board < 0].sum())
-    while current_white < PLAYER_CHECKERS:
-        pos = int(numpy.random.randint(0, 24))
-        if board[pos] <= 0:  # empty or already white
-            board[pos] -= 1
-            current_white += 1
-
+    assert board[BOARD_LENGTH:].sum() == 0  # nothing on bar/off
+    assert board.sum() == 0                 # exactly 15 checkers per side
     return board
 
 
@@ -389,7 +400,15 @@ def strategy_action_and_weights(state, key, strategy, config, eval_cls, temperat
     is_chance = state.has_chance_logits(chance_logits)
     dice_action = jax.random.categorical(key_dice, chance_logits, axis=-1)
 
-    logits = candidate_equities / jnp.maximum(temperature, 1e-6)
+    B = state.observation.shape[0]
+    temperature = jnp.asarray(temperature) * jnp.ones((B,))  # scalar or per-game (B,)
+    # mask BEFORE the temperature division: masked candidates hold finfo.min
+    # (finite!), which only overflows to -inf for small temperatures - at
+    # temperature ~1 the mask would stay finite and make illegal candidates
+    # sampleable at no-move nodes
+    logits = jnp.where(
+        jnp.isfinite(candidate_equities), candidate_equities, jnp.float32(-jnp.inf)
+    ) / jnp.maximum(temperature, 1e-6)[:, jnp.newaxis]
     has_candidates = jnp.isfinite(logits).any(axis=-1)
     game_range = jnp.arange(state.observation.shape[0])
 
@@ -462,7 +481,7 @@ def make_selfplay_fn(forward, value_to_scalar_fn, env, config, strategy, eval_cl
                 action_weights = policy_output.action_weights
             else:
                 action, action_weights, is_chance_node = strategy_action_and_weights(
-                    state, key1, strategy, model_config, eval_cls, config.temperature
+                    state, key1, strategy, model_config, eval_cls, game_temperatures
                 )
 
             actor = state.current_player
@@ -485,10 +504,22 @@ def make_selfplay_fn(forward, value_to_scalar_fn, env, config, strategy, eval_cl
                 is_turn_end=is_turn_end,
             )
 
-        # Run selfplay for max_num_steps by batch
         rng_key, sub_key = jax.random.split(rng_key)
         keys = jax.random.split(sub_key, batch_size)
         state = jax.vmap(custom_init_fn)(keys)
+
+        # per-game temperature: each game draws its temperature once from the
+        # schedule (or uses the scalar `temperature` when no schedule is set)
+        # and keeps it for the whole game, so low-temperature games stay
+        # consistent and high-temperature games genuinely explore
+        if config.temperature_schedule is not None:
+            fractions = jnp.array([f for f, _ in config.temperature_schedule])
+            temps = jnp.array([t for _, t in config.temperature_schedule])
+            key_temp, rng_key = jax.random.split(rng_key)
+            schedule_idx = jax.random.categorical(key_temp, jnp.log(fractions), axis=-1, shape=(batch_size,))
+            game_temperatures = jnp.array([t for _, t in config.temperature_schedule])[schedule_idx]
+        else:
+            game_temperatures = config.temperature
 
         # this is a simplified version of Apply Self-Supervised Value Alignment (SVAL)
         # where we warmup all games within the batch by a number of randomly chosen steps based on position type
@@ -502,12 +533,35 @@ def make_selfplay_fn(forward, value_to_scalar_fn, env, config, strategy, eval_cl
             random_steps_custom = jax.random.randint(sval_key, (batch_size,), 0, config.sval_custom_max_steps + 1)
             limit_steps = jnp.where(is_initial, random_steps_initial, random_steps_custom)
 
+            # a per-game coin flip (fixed for the whole warmup) decides whether
+            # the game is warmed up with random legal moves instead of greedy
+            # strategy play: purely greedy warmups keep every collected state
+            # on a greedy corridor, random play seeds the off-corridor
+            # positions the value net must also judge (and punish)
+            key_mask, rng_key = jax.random.split(rng_key)
+            is_random_game = jax.random.uniform(key_mask, (batch_size,)) < config.sval_random_prob
+
             def sval_body(i, carry):
                 state_carry, key_carry = carry
-                key_act, key_reset, key_next = jax.random.split(key_carry, 3)
+                key_act, key_rand, key_reset, key_next = jax.random.split(key_carry, 4)
 
-                # Query the lookahead strategy with the neural network evaluator
-                action = strategy.get_next_action_batch(state_carry, key_act, model_config, eval_cls)
+                # greedy: the lookahead strategy with the neural network evaluator
+                strategy_action = strategy.get_next_action_batch(state_carry, key_act, model_config, eval_cls)
+
+                # random: uniform over legal moves; at chance nodes the roll
+                # is sampled from the true dice odds
+                key_move, key_dice = jax.random.split(key_rand)
+                move_logits = jnp.where(
+                    state_carry.legal_action_mask, 0.0, jnp.float32(-jnp.inf)
+                )
+                random_move = jax.random.categorical(key_move, move_logits, axis=-1)
+                chance_logits = state_carry.get_chance_logits()
+                random_dice = jax.random.categorical(key_dice, chance_logits, axis=-1)
+                random_action = jnp.where(
+                    state_carry.has_chance_logits(chance_logits), random_dice, random_move
+                )
+
+                action = jnp.where(is_random_game, random_action, strategy_action)
 
                 next_state = jax.vmap(auto_reset(env.step, custom_init_fn))(
                     state_carry, action, jax.random.split(key_reset, batch_size)
