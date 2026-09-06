@@ -80,7 +80,7 @@ class NNConfig:
     correctly when the strategies jit through core.broadcast_config():
     should_broadcast=False short-circuits the (pointless) config repetition
     and micro_batch_size sizes the strategies' chunked evaluation."""
-    micro_batch_size: int = struct.field(pytree_node=False, default=512)
+    micro_batch_size: int = struct.field(pytree_node=False, default=256)
     should_broadcast: bool = struct.field(pytree_node=False, default=False)
     two_ply_top_k: int = struct.field(pytree_node=False, default=0)
 
