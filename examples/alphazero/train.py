@@ -130,6 +130,20 @@ class Config(BaseModel):
     @classmethod
     def _check_sval_temperature_schedule(cls, v):
         return _validate_temperature_schedule(v, "sval_temperature_schedule")
+
+    @field_validator("learning_rate_schedule")
+    @classmethod
+    def _check_learning_rate_schedule(cls, v):
+        if v is None:
+            return v
+        if not v or v[0][0] != 0:
+            raise ValueError(f"learning_rate_schedule must start at step 0, got {v}")
+        steps = [s for s, _ in v]
+        if any(b <= a for a, b in zip(steps, steps[1:])):
+            raise ValueError(f"learning_rate_schedule steps must strictly increase, got {v}")
+        if any(lr <= 0 for _, lr in v):
+            raise ValueError(f"learning_rate_schedule lrs must be positive, got {v}")
+        return v
     temperature: float = 0.1     # when this is zero we take the best move every time, higher values increase randomness
     # per-game temperature mix: [(fraction, temperature), ...], fractions sum to 1.
     # Each game draws its temperature once (fixed for the whole game) - low
@@ -137,6 +151,12 @@ class Config(BaseModel):
     # games explore lower-equity continuations.  None = use `temperature` for
     # every game.
     temperature_schedule: Optional[List[Tuple[float, float]]] = None
+    # LR ladder in OPTIMIZER STEPS [(step, lr), ...], first entry at step 0.
+    # Conversion: 1024 optimizer steps = 1 training iteration for the current
+    # batch sizes (131072 frames per iteration // 128 training batch).
+    # Constant 1e-3 plateaus at parity with 20-iteration-old champions; the
+    # ladder descends if a stage also stalls.
+    learning_rate_schedule: Optional[List[Tuple[int, float]]] = None
     # strategy sampling temperature for eval/vs_champions (a yardstick, not
     # training data): 0 = argmax
     eval_temperature: float = 0.0
@@ -838,7 +858,16 @@ def main_selfplay():
         # warmup corridors: half argmax, quarters at 0.01 / 0.1 (the
         # uniform-random half is separate, via sval_random_prob)
         sval_temperature_schedule=[(0.5, 0.0), (0.25, 0.01), (0.25, 0.1)],
-        load_checkpoint_path='checkpoints/selfplay_20260902_19:26:54_00028.pkl',
+        # --- learning rate schedule history ------------------------------
+        # (comment out superseded schedules; note the iteration each was
+        # first used - iteration 0 here = resume from ..._00232.pkl)
+        # constant 1e-3: original run (it0-28) and this run's iters 0-232 -
+        # genuine early improvement, then ~200 iterations at parity with
+        # 20-iteration-old champions (plateau)
+        # 2026-09-06, iter 0 (resume from it232): ladder 3e-4 -> 1e-4 ->
+        #   3e-5 at iterations 40 / 80 (= steps 40960 / 81920)
+        learning_rate_schedule=[(0, 3e-4), (40960, 1e-4), (81920, 3e-5)],
+        load_checkpoint_path='checkpoints/selfplay_20260905_23:52:48_00232.pkl',
     )
     if jax.process_index() == 0:
         print(config)
@@ -883,7 +912,17 @@ def main_selfplay():
         return policy_out, value_out
 
     forward = hk.without_apply_rng(hk.transform_with_state(forward_fn))
-    optimizer = optax.adam(learning_rate=config.learning_rate)
+    # LR ladder: piecewise-constant schedule by optimizer step (falls back to
+    # the scalar learning_rate when no schedule is configured)
+    if config.learning_rate_schedule:
+        lrs = [lr for _, lr in config.learning_rate_schedule]
+        boundaries = [s for s, _ in config.learning_rate_schedule][1:]
+        lr_schedule = optax.join_schedules(
+            [optax.constant_schedule(lr) for lr in lrs], boundaries=boundaries
+        )
+        optimizer = optax.adam(learning_rate=lr_schedule)
+    else:
+        optimizer = optax.adam(learning_rate=config.learning_rate)
 
     # both strategies drive selfplay moves and seed-position generation alike
     if config.strategy_name == "fullturn":
