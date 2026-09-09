@@ -860,14 +860,19 @@ def main_selfplay():
         sval_temperature_schedule=[(0.5, 0.0), (0.25, 0.01), (0.25, 0.1)],
         # --- learning rate schedule history ------------------------------
         # (comment out superseded schedules; note the iteration each was
-        # first used - iteration 0 here = resume from ..._00232.pkl)
+        # first used - iteration 0 here = resume from the ladder run's
+        # ..._15:12:49_00100.pkl, i.e. it232 + 100 ladder iterations)
         # constant 1e-3: original run (it0-28) and this run's iters 0-232 -
         # genuine early improvement, then ~200 iterations at parity with
         # 20-iteration-old champions (plateau)
-        # 2026-09-06, iter 0 (resume from it232): ladder 3e-4 -> 1e-4 ->
-        #   3e-5 at iterations 40 / 80 (= steps 40960 / 81920)
-        learning_rate_schedule=[(0, 3e-4), (40960, 1e-4), (81920, 3e-5)],
-        load_checkpoint_path='checkpoints/selfplay_20260905_23:52:48_00232.pkl',
+        # 2026-09-07, iter 0 (resume from it232): ladder 3e-4 -> 1e-4 ->
+        #   3e-5 at iterations 40 / 80 (= steps 40960 / 81920).  The ladder
+        # run's it100 beats it233 0.586 +/- 0.085 in the full-turn
+        # tournament, so the descent is kept.
+        # 2026-09-08, iter 0 (resume from ladder-run it100): continue the
+        #   final stage at 3e-5
+        learning_rate_schedule=[(0, 3e-5)],
+        load_checkpoint_path='checkpoints/selfplay_20260907_15:12:49_00100.pkl',
     )
     if jax.process_index() == 0:
         print(config)
