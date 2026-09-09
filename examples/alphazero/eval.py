@@ -215,13 +215,14 @@ def select_checkpoints(files, num_models: int):
 
 
 class EvalConfig:
-    def __init__(self, mode="1ply", temperature=0.1, batch_size=128, max_steps=1024,
+    def __init__(self, mode="fullturn", temperature=0.1, batch_size=128, max_steps=1024,
                  eval_chunk=8192):
-        self.mode = mode          # "1ply" or "2ply" value-head lookahead
+        self.mode = mode          # "fullturn" (deployment player), or legacy "1ply"/"2ply"
         self.temperature = temperature  # sampling temperature over candidate equities (0 = greedy)
         self.batch_size = batch_size    # games played in parallel per jitted chunk
         self.max_steps = max_steps      # games reaching this many steps count as draws
         self.eval_chunk = eval_chunk    # boards per forward pass (memory bound for 2ply)
+        self.strategy_micro_batch = 256  # skip-path chunk for the fullturn strategy
 
 
 def eval_equity(model, params, bn_state, obs, chunk: int):
@@ -317,18 +318,74 @@ def make_choose_actions(env, model_a, model_b, cfg: EvalConfig):
 _RUNNER_CACHE = {}
 
 
+def make_config_net_evaluator_cls(model: Model):
+    """A pgx.core.Evaluator whose forward reads params/bn_state from the
+    config passed at construction, not from a baked-in closure.  The
+    tournament's runner cache is keyed by architecture, so evaluators must
+    stay parameter-agnostic - a closure-baked evaluator made every cached
+    chunk_fn replay the first matchup's weights."""
+    forward = model.forward
+    value_to_scalar = model.value_to_scalar
+
+    class ConfigNetEvaluator(pgx.core.Evaluator):
+        expensive_evaluation = True
+
+        def __init__(self, config=None):
+            super().__init__(config)
+
+        def eval(self, state: pgx.core.State, idx=None):
+            (_, v), _ = forward.apply(self.config.model_params, self.config.model_state,
+                                      state.observation, is_eval=True)
+            return value_to_scalar(v)
+
+    return ConfigNetEvaluator
+
+
+def make_fullturn_choose_actions(env, model_a, model_b, cfg: EvalConfig):
+    """Move selection with the deployment player: the full-turn lookahead
+    strategy driven by each side's own value head.  Chance nodes roll at true
+    dice odds inside strategy_action_and_weights, so both sides' calls see the
+    same roll and only the mover's is used.  Params stay call-time arguments
+    (via the config-carried evaluator), keeping the runner cache safe."""
+    from examples.alphazero.train import strategy_action_and_weights, NNConfig as ParamNNConfig
+    from pgx.backgammon import BackgammonFullTurnStrategy
+
+    strategy = BackgammonFullTurnStrategy(env)
+    eval_cls = make_config_net_evaluator_cls(model_a)
+    temperature = jnp.asarray(cfg.temperature)
+
+    def choose_actions(state, key, params_a, bn_a, params_b, bn_b, pid_a):
+        key1, key2, key3 = jax.random.split(key, 3)
+        sconfig_a = ParamNNConfig(model_params=params_a, model_state=bn_a,
+                                  micro_batch_size=cfg.strategy_micro_batch)
+        sconfig_b = ParamNNConfig(model_params=params_b, model_state=bn_b,
+                                  micro_batch_size=cfg.strategy_micro_batch)
+        action_a, _, _ = strategy_action_and_weights(
+            state, key1, strategy, sconfig_a, eval_cls, temperature)
+        action_b, _, _ = strategy_action_and_weights(
+            state, key1, strategy, sconfig_b, eval_cls, temperature)
+        action = jnp.where(state.current_player == pid_a, action_a, action_b)
+        return action, key3
+
+    return choose_actions
+
+
 def make_chunk_fn(env, model_a, model_b, cfg: EvalConfig):
     """Jitted runner that plays cfg.batch_size games of model_a vs model_b.
 
     model_a owns player id `pid_a` (its net picks the moves of that side) and
     the fn returns (reward of model_a per game, terminated per game).
     """
-    cache_key = (model_a.arch, model_b.arch, cfg.mode, cfg.batch_size, cfg.max_steps)
+    cache_key = (model_a.arch, model_b.arch, cfg.mode, cfg.batch_size, cfg.max_steps,
+                 id(model_a), id(model_b))
     if cache_key in _RUNNER_CACHE:
         return _RUNNER_CACHE[cache_key]
 
     batch = cfg.batch_size
-    choose_actions = make_choose_actions(env, model_a, model_b, cfg)
+    if cfg.mode == "fullturn":
+        choose_actions = make_fullturn_choose_actions(env, model_a, model_b, cfg)
+    else:
+        choose_actions = make_choose_actions(env, model_a, model_b, cfg)
 
     def chunk_fn(key, params_a, bn_a, params_b, bn_b, pid_a):
         key, init_key = jax.random.split(key)
@@ -459,7 +516,7 @@ def main():
                         help="models eliminated after each round robin")
     parser.add_argument("--final-games", type=int, default=512,
                         help="games for best vs 2nd/3rd/4th")
-    parser.add_argument("--mode", choices=["1ply", "2ply"], default="1ply",
+    parser.add_argument("--mode", choices=["fullturn", "1ply", "2ply"], default="fullturn",
                         help="value-head lookahead depth used by both players "
                              "(2ply is ~8x slower per game)")
     parser.add_argument("--dtype", choices=["bfloat16", "float32"], default="bfloat16",
