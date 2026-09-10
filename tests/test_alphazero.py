@@ -162,6 +162,7 @@ def test_td_lambda_targets_propagate_through_rolls_and_turns():
         is_chance_node=jnp.zeros((1, max_num_steps, B), dtype=jnp.bool_),
         value=jnp.tile(jnp.array([0.5, 0.3, 0.2, 0.1])[None, :, None, None], (1, 1, B, 1)),
         is_turn_end=jnp.zeros((1, max_num_steps, B), dtype=jnp.bool_),
+        search_value=jnp.zeros((1, max_num_steps, B)),
     )
     sample = compute_loss_input(data)
     # v3 = r3 = 1.0
@@ -209,3 +210,146 @@ def test_sample_action_with_dice_uses_true_odds():
     )
     selected_legal = legal[jnp.arange(B)[None, :], acts]
     assert bool(selected_legal.all())
+
+
+
+def test_search_value_semantics():
+    """The search-consistency target must be the strategy's max candidate
+    equity at move nodes, and 0 at chance and must-pass nodes (where the
+    candidate boards are meaningless or absent)."""
+    import numpy
+    from pgx.backgammon import BAR_IDX, BOARD_DTYPE, _arr_legal_action_mask
+
+    strategy = BackgammonTwoPlyStrategy(env)
+    eval_cls = SimpleBackgammonEvaluator
+    eval_config = SimpleBackgammonEvaluatorConfig()
+    # scalar handcrafted weights: the strategies pass the config straight to
+    # the evaluator, which reads its weights from it
+    sconfig = SimpleBackgammonEvaluatorConfig()
+    B = 8
+
+    # chance nodes report 0
+    states = jax.vmap(env.init)(jax.random.split(jax.random.PRNGKey(0), B))
+    chance_states = jax.vmap(_change_turn)(states, jax.random.split(jax.random.PRNGKey(1), B))
+    _, _, is_chance, search_value = strategy_action_and_weights(
+        chance_states, jax.random.PRNGKey(2), strategy, sconfig, eval_cls, jnp.float32(0.01)
+    )
+    assert bool(numpy.asarray(is_chance).all())
+    assert bool((numpy.asarray(search_value) == 0.0).all()), "chance nodes must report search_value 0"
+
+    # must-pass nodes report 0
+    board = jnp.zeros(28, dtype=BOARD_DTYPE)
+    board = board.at[BAR_IDX].set(15)
+    for pos, cnt in zip(range(0, 6), [3, 3, 3, 2, 2, 2]):
+        board = board.at[pos].set(-cnt)
+    playable = jnp.array([2, 4, -1, -1], dtype=jnp.int32)
+    legal = jax.vmap(lambda b: _arr_legal_action_mask(b, playable))(jnp.stack([board] * B))
+    no_move_states = chance_states.replace(
+        _board=jnp.stack([board] * B),
+        _playable_dice=jnp.stack([playable] * B),
+        legal_action_mask=legal,
+    )
+    _, _, _, search_value = strategy_action_and_weights(
+        no_move_states, jax.random.PRNGKey(2), strategy, sconfig, eval_cls, jnp.float32(0.01)
+    )
+    assert bool((numpy.asarray(search_value) == 0.0).all()), "must-pass nodes must report search_value 0"
+
+    # real move nodes: search_value == max over legal candidate equities
+    _, cand_eq, _ = strategy.get_next_action_and_equities_batch(
+        states, jax.random.PRNGKey(3), eval_config, eval_cls
+    )
+    _, _, _, search_value = strategy_action_and_weights(
+        states, jax.random.PRNGKey(3), strategy, sconfig, eval_cls, jnp.float32(0.01)
+    )
+    legal_mask = cand_eq > jnp.float32(jnp.finfo(jnp.float32).min / 2)
+    has_cand = legal_mask.any(axis=-1)
+    expected = jnp.where(
+        has_cand, jnp.max(jnp.where(legal_mask, cand_eq, jnp.float32(0.0)), axis=-1), 0.0
+    )
+    assert bool(jnp.allclose(numpy.asarray(search_value), numpy.asarray(expected), atol=1e-5)), (
+        numpy.asarray(search_value), numpy.asarray(expected)
+    )
+
+
+def test_search_loss_regresses_prediction_to_search_value():
+    """The TD-leaf-style auxiliary loss must pull the value prediction toward
+    the strategy's search value when weighted, while the outcome-only loss
+    (weight 0) pulls it toward the (zero) terminal target instead."""
+    import numpy
+    import optax
+    from examples.alphazero.train import (
+        SelfplayOutput, make_compute_loss_input_fn, make_loss_fn,
+    )
+
+    vts = _value_to_scalar(1)
+    strategy = BackgammonTwoPlyStrategy(env)
+    B = 8
+
+    states = jax.vmap(env.init)(jax.random.split(jax.random.PRNGKey(0), B))
+    _, _, _, search_value = strategy_action_and_weights(
+        states, jax.random.PRNGKey(7), strategy,
+        SimpleBackgammonEvaluatorConfig(),
+        SimpleBackgammonEvaluator, jnp.float32(0.01),
+    )
+    # the handcrafted evaluator's equity at these states is nonzero
+    assert float(jnp.abs(search_value).max()) > 0.1
+
+    config = Config(selfplay_batch_size=B, max_num_steps=1, train_policy_network=False,
+                    td_lambda=1.0, num_value_channels=1)
+    sample = make_compute_loss_input_fn(lambda r: r[..., jnp.newaxis], config)(
+        SelfplayOutput(
+            obs=states.observation[jnp.newaxis, jnp.newaxis],
+            reward=jnp.zeros((1, 1, B)),
+            terminated=jnp.ones((1, 1, B), dtype=jnp.bool_),
+            action_weights=jnp.zeros((1, 1, B, ACTION_TOTAL_LENGTH)),
+            discount=jnp.zeros((1, 1, B)),
+            is_chance_node=jnp.zeros((1, 1, B), dtype=jnp.bool_),
+            value=jnp.zeros((1, 1, B, 1)),
+            is_turn_end=jnp.ones((1, 1, B), dtype=jnp.bool_),
+            search_value=search_value[jnp.newaxis, jnp.newaxis, :],
+        )
+    )
+
+    forward = _make_tiny_forward(num_value_channels=1, train_policy=False)
+
+    def predict(p, bn):
+        (_, v), _ = forward.apply(p, bn, states.observation, is_eval=True)
+        return numpy.asarray(vts(v))
+
+    params0, bn0 = forward.init(jax.random.PRNGKey(11), states.observation)
+    pred_before = predict(params0, bn0)
+
+    def run(weight, steps=30, lr=0.05):
+        cfg = Config(selfplay_batch_size=B, max_num_steps=1, train_policy_network=False,
+                     td_lambda=1.0, num_value_channels=1, search_value_weight=weight)
+        loss_fn = make_loss_fn(forward, vts, env, cfg)
+        # flatten the (device, T, B, ...) layout the same way the main loop does
+        flat = jax.tree_util.tree_map(lambda x: x.reshape((-1, *x.shape[3:])), sample)
+        optimizer = optax.adam(lr)
+        opt_state = optimizer.init(params0)
+        params = params0
+        model_state = bn0
+        for _ in range(steps):
+            grads, (model_state, _, _, _) = jax.grad(loss_fn, has_aux=True)(
+                params, model_state, flat)
+            updates, opt_state = optimizer.update(grads, opt_state)
+            params = optax.apply_updates(params, updates)
+        return predict(params, model_state)
+
+    pred_w0 = run(0.0)
+    pred_w10 = run(10.0)
+    sv = numpy.asarray(search_value)
+
+    # weight 0: only the outcome loss acts, pulling toward the zero target
+    assert numpy.abs(pred_w0).mean() < numpy.abs(pred_before).mean(), (
+        "weight 0: prediction should move toward the outcome target 0")
+    # strong weight: the prediction moves toward the search values (all
+    # positive here) much further than the outcome-only run does; the tiny
+    # net saturates below large targets, so compare against the w0 run
+    # rather than asking to reach the target exactly
+    assert numpy.mean(pred_w10) - numpy.mean(pred_w0) > 0.5, (
+        f"weight 10: prediction should move toward the search value "
+        f"(got mean {numpy.mean(pred_w10):.3f} vs {numpy.mean(pred_w0):.4f}, "
+        f"targets mean {numpy.mean(sv):.3f})")
+    assert numpy.abs(pred_w10 - sv).mean() < numpy.abs(pred_w0 - sv).mean(), (
+        "weight 10: prediction should end up closer to the search value than the outcome-only run")

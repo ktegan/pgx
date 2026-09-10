@@ -360,9 +360,9 @@ def make_fullturn_choose_actions(env, model_a, model_b, cfg: EvalConfig):
                                   micro_batch_size=cfg.strategy_micro_batch)
         sconfig_b = ParamNNConfig(model_params=params_b, model_state=bn_b,
                                   micro_batch_size=cfg.strategy_micro_batch)
-        action_a, _, _ = strategy_action_and_weights(
+        action_a, _, _, _ = strategy_action_and_weights(
             state, key1, strategy, sconfig_a, eval_cls, temperature)
-        action_b, _, _ = strategy_action_and_weights(
+        action_b, _, _, _ = strategy_action_and_weights(
             state, key1, strategy, sconfig_b, eval_cls, temperature)
         action = jnp.where(state.current_player == pid_a, action_a, action_b)
         return action, key3

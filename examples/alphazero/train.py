@@ -166,6 +166,19 @@ class Config(BaseModel):
     training_batch_size: int = 128
     learning_rate: float = 0.001
     td_lambda: float = 0.9        # reduce this to 0.75 as training advances, 0.0 is pure temporal differencing (learning from value estimate diffs during the game), 1.0 is pure monte carlo sampling (learning only from terminal states at the end of the game)
+    # TD-leaf-style search-consistency auxiliary loss: at every move node the
+    # value prediction is regressed toward the strategy's search value (the max
+    # candidate equity of the current turn's lookahead).  0 disables it.
+    search_value_weight: float = 0.0
+
+    @field_validator("search_value_weight")
+    @classmethod
+    def _check_search_value_weight(cls, v, info):
+        # the MCTS collection path reports no search values (all zero), so the
+        # auxiliary loss would be meaningless there
+        if v and info.data.get("train_policy_network"):
+            raise ValueError("search_value_weight requires train_policy_network=False")
+        return v
     # eval params
     eval_interval: int = 1
     load_checkpoint_path: str = ""
@@ -423,12 +436,16 @@ class SelfplayOutput(NamedTuple):
     is_chance_node: jnp.ndarray
     value: jnp.ndarray
     is_turn_end: jnp.ndarray
+    search_value: jnp.ndarray
 
 
 def strategy_action_and_weights(state, key, strategy, config, eval_cls, temperature):
     """
     Sample actions and policy weights for a batch of states using a backgammon
-    lookahead strategy.
+    lookahead strategy.  Also returns each game's search value: the strategy's
+    deepest equity estimate at this node (max over candidate equities, 0 at
+    chance or must-pass nodes) - the target of the TD-leaf-style auxiliary
+    value loss when search_value_weight > 0.
 
     Chance nodes (start of a turn, dice not yet rolled) are sampled from the
     chance logits so rolls follow the true dice probabilities.  At no-move
@@ -470,7 +487,16 @@ def strategy_action_and_weights(state, key, strategy, config, eval_cls, temperat
     # single-die states give die1_idx == die2_idx); .set() would clobber a legal
     # candidate's prob with a later duplicate's 0
     action_weights = action_weights.at[game_range[:, jnp.newaxis], candidate_action_indices].max(probs)
-    return action, action_weights, is_chance
+
+    # the strategy's search value at this node: the deepest equity estimate of
+    # the current turn (max over candidates).  Illegal entries carry the
+    # finfo.min mask marker; an all-masked node (must-pass) has no candidates
+    # and chance nodes carry meaningless candidate boards - both report 0.
+    max_eq = jnp.max(candidate_equities, axis=-1)
+    search_value = jnp.where(
+        is_chance | (max_eq <= jnp.finfo(jnp.float32).min / 2), 0.0, max_eq
+    )
+    return action, action_weights, is_chance, search_value
 
 
 def make_selfplay_fn(forward, value_to_scalar_fn, env, config, strategy, eval_cls):
@@ -528,8 +554,9 @@ def make_selfplay_fn(forward, value_to_scalar_fn, env, config, strategy, eval_cl
                 )
                 action = policy_output.action
                 action_weights = policy_output.action_weights
+                search_value = jnp.zeros_like(value_scalar)
             else:
-                action, action_weights, is_chance_node = strategy_action_and_weights(
+                action, action_weights, is_chance_node, search_value = strategy_action_and_weights(
                     state, key1, strategy, model_config, eval_cls, game_temperatures
                 )
 
@@ -551,6 +578,7 @@ def make_selfplay_fn(forward, value_to_scalar_fn, env, config, strategy, eval_cl
                 is_chance_node=is_chance_node,
                 value=value,
                 is_turn_end=is_turn_end,
+                search_value=search_value,
             )
 
         rng_key, sub_key = jax.random.split(rng_key)
@@ -608,7 +636,7 @@ def make_selfplay_fn(forward, value_to_scalar_fn, env, config, strategy, eval_cl
 
                 # strategy moves at the game's warmup temperature (0 = argmax);
                 # chance nodes roll from the true dice odds inside
-                strategy_action, _, _ = strategy_action_and_weights(
+                strategy_action, _, _, _ = strategy_action_and_weights(
                     state_carry, key_act, strategy, model_config, eval_cls, sval_game_temperatures
                 )
 
@@ -656,6 +684,7 @@ class Sample(NamedTuple):
     mask: jnp.ndarray
     is_chance_node: jnp.ndarray
     is_turn_end: jnp.ndarray
+    search_value: jnp.ndarray
 
 
 def make_compute_loss_input_fn(reward_transform_fn, config):
@@ -695,6 +724,7 @@ def make_compute_loss_input_fn(reward_transform_fn, config):
             mask=value_mask,
             is_chance_node=data.is_chance_node,
             is_turn_end=data.is_turn_end,
+            search_value=data.search_value,
         )
     return compute_loss_input
 
@@ -702,7 +732,7 @@ def make_compute_loss_input_fn(reward_transform_fn, config):
 
 
 
-def make_loss_fn(forward, env, config):
+def make_loss_fn(forward, value_to_scalar_fn, env, config):
     def loss_fn(model_params, model_state, samples: Sample):
         (logits, value), model_state = forward.apply(
             model_params, model_state, samples.obs, is_eval=False
@@ -724,7 +754,19 @@ def make_loss_fn(forward, env, config):
             v_mask = jnp.where(samples.is_turn_end, v_mask, 0.0)
         value_loss = jnp.mean(value_loss * v_mask[..., jnp.newaxis])
 
-        return policy_loss + value_loss, (model_state, policy_loss, value_loss)
+        # TD-leaf-style search-consistency auxiliary loss: regress the value
+        # prediction toward the strategy's search value at this node (the max
+        # candidate equity of the current turn's lookahead).  Unlike the main
+        # value loss this is NOT restricted to turn-end nodes - mid-turn states
+        # are exactly the boards the strategy scores when picking moves, so
+        # this term trains the decision function on its own inputs.
+        pred_scalar = value_to_scalar_fn(value)
+        search_loss = optax.l2_loss(pred_scalar, samples.search_value)
+        s_mask = jnp.where(samples.is_chance_node, 0.0, samples.mask)
+        search_loss = jnp.mean(search_loss * s_mask)
+
+        total = policy_loss + value_loss + config.search_value_weight * search_loss
+        return total, (model_state, policy_loss, value_loss, search_loss)
     return loss_fn
 
 
@@ -732,14 +774,14 @@ def make_train_fn(optimizer, loss_fn):
     @partial(jax.pmap, axis_name="i")
     def train(model, opt_state, data: Sample):
         model_params, model_state = model
-        grads, (model_state, policy_loss, value_loss) = jax.grad(loss_fn, has_aux=True)(
+        grads, (model_state, policy_loss, value_loss, search_loss) = jax.grad(loss_fn, has_aux=True)(
             model_params, model_state, data
         )
         grads = jax.lax.pmean(grads, axis_name="i")
         updates, opt_state = optimizer.update(grads, opt_state)
         model_params = optax.apply_updates(model_params, updates)
         model = (model_params, model_state)
-        return model, opt_state, policy_loss, value_loss
+        return model, opt_state, policy_loss, value_loss, search_loss
     return train
 
 
@@ -811,10 +853,10 @@ def make_evaluate_fn(forward, value_to_scalar_fn, env, config, strategy, eval_cl
                 key, state, R, terminated, step_i = carry
                 key, k_step, k_next = jax.random.split(key, 3)
                 is_my_turn = state.current_player == 0
-                my_action, _, _ = strategy_action_and_weights(
+                my_action, _, _, _ = strategy_action_and_weights(
                     state, k_step, strategy, my_cfg, eval_cls, temperature
                 )
-                champ_action, _, _ = strategy_action_and_weights(
+                champ_action, _, _, _ = strategy_action_and_weights(
                     state, k_step, strategy, champ_cfg, eval_cls, temperature
                 )
                 action = jnp.where(is_my_turn, my_action, champ_action)
@@ -872,6 +914,16 @@ def main_selfplay():
         # 2026-09-08, iter 0 (resume from ladder-run it100): continue the
         #   final stage at 3e-5
         learning_rate_schedule=[(0, 3e-5)],
+        # --- objective history -------------------------------------------
+        # td_lambda 0.9: original runs - 90% of each target was the net's own
+        #   bootstrap, value_loss floored at ~0.0004 (self-consistent, little
+        #   external signal)
+        # 2026-09-08, iter 0: nudge 1 - td_lambda 1.0 (pure Monte Carlo: every
+        #   position trains on its game's actual outcome) + nudge 2 - the
+        #   TD-leaf-style search-consistency auxiliary loss (value head
+        #   regressed to the strategy's search value each move)
+        td_lambda=1.0,
+        search_value_weight=1.0,
         load_checkpoint_path='checkpoints/selfplay_20260907_15:12:49_00100.pkl',
     )
     if jax.process_index() == 0:
@@ -947,7 +999,7 @@ def main_selfplay():
     selfplay = make_selfplay_fn(forward, value_to_scalar, env, config, strategy, AZNetEvaluatorWrapper)
     compute_loss_input = make_compute_loss_input_fn(reward_transform, config)
 
-    loss_fn = make_loss_fn(forward, env, config)
+    loss_fn = make_loss_fn(forward, value_to_scalar, env, config)
     train = make_train_fn(optimizer, loss_fn)
     evaluate = make_evaluate_fn(forward, value_to_scalar, env, config, strategy, AZNetEvaluatorWrapper)
 
@@ -1124,14 +1176,16 @@ def main_selfplay():
         if jax.process_index() == 0:
             print('  starting training...')
         # Training
-        policy_losses, value_losses = [], []
+        policy_losses, value_losses, search_losses = [], [], []
         for i in range(num_updates):
             minibatch: Sample = jax.tree_util.tree_map(lambda x: x[i], minibatches)
-            model, opt_state, policy_loss, value_loss = train(model, opt_state, minibatch)
+            model, opt_state, policy_loss, value_loss, search_loss = train(model, opt_state, minibatch)
             policy_losses.append(policy_loss.mean().item())
             value_losses.append(value_loss.mean().item())
+            search_losses.append(search_loss.mean().item())
         policy_loss = sum(policy_losses) / len(policy_losses)
         value_loss = sum(value_losses) / len(value_losses)
+        search_loss = sum(search_losses) / len(search_losses)
 
         et = time.time()
         hours += (et - st) / 3600
@@ -1139,6 +1193,7 @@ def main_selfplay():
             {
                 "train/policy_loss": policy_loss,
                 "train/value_loss": value_loss,
+                "train/search_loss": search_loss,
                 "hours": hours,
                 "frames": frames,
             }
