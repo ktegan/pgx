@@ -53,6 +53,8 @@ GLOBAL_ENCODE_ELEM = BAR_POSITIONS + OFF_POSITIONS
 CHANNEL_ELEM       = BOARD_ENCODE_ELEM + GLOBAL_ENCODE_ELEM
 OBSERVATION_SHAPE  = (BOARD_LENGTH, 1, CHANNEL_ELEM)  # typically boards are encoded as (height, width, channels) in neural network architectures
 BAR_ENCODE_SCALE   = 2.0    # usually there are two or less checkers on the bar
+OBS_BAR_ELEM       = BOARD_ENCODE_ELEM                    # obs channel of the black bar count, mirrors the board slot BAR_IDX (white bar is OBS_BAR_ELEM + 1)
+OBS_OFF_ELEM       = BOARD_ENCODE_ELEM + BAR_POSITIONS    # obs channel of the black off count, mirrors the board slot OFF_IDX (white off is OBS_OFF_ELEM + 1)
 
 START_BOARD        = (2, 0, 0, 0, 0, -5, 0, -3, 0, 0, 0, 5, -5, 0, 0, 0, 3, 0, 5, 0, 0, 0, 0, -2)
 START_POSITIONS    = START_BOARD + (0, 0) + (0, 0)
@@ -430,10 +432,10 @@ def _observation_to_board(observation: Array) -> Array:
     board = jnp.concatenate([
         board_pts,
         jnp.array([
-             jax.lax.round(obs[0, 8] * BAR_ENCODE_SCALE),
-            -jax.lax.round(obs[0, 9] * BAR_ENCODE_SCALE),
-             jax.lax.round(obs[0, 10] * PLAYER_CHECKERS),
-            -jax.lax.round(obs[0, 11] * PLAYER_CHECKERS)
+             jax.lax.round(obs[0, OBS_BAR_ELEM] * BAR_ENCODE_SCALE),
+            -jax.lax.round(obs[0, OBS_BAR_ELEM + 1] * BAR_ENCODE_SCALE),
+             jax.lax.round(obs[0, OBS_OFF_ELEM] * PLAYER_CHECKERS),
+            -jax.lax.round(obs[0, OBS_OFF_ELEM + 1] * PLAYER_CHECKERS)
         ])
     ], axis=None, dtype=BOARD_DTYPE)
     return board
@@ -1603,13 +1605,13 @@ class BackgammonFullTurnStrategy(core.Strategy):
             default=res_2ply.best_action_nd
         )
 
-        # Compute equities for each of the 52 candidate first actions for doubles
+        # Compute equities for each of the candidate first actions for doubles
         batch_idx = jnp.arange(B)[:, jnp.newaxis]
 
-        move3_equities = jnp.full((B, 52), jnp.finfo(move3_scores.dtype).min)
+        move3_equities = jnp.full((B, 2 * SRC_LENGTH), jnp.finfo(move3_scores.dtype).min)
         move3_equities = move3_equities.at[batch_idx, unique_first_move_3].max(move3_scores)
 
-        move4_equities = jnp.full((B, 52), jnp.finfo(move4_scores.dtype).min)
+        move4_equities = jnp.full((B, 2 * SRC_LENGTH), jnp.finfo(move4_scores.dtype).min)
         move4_equities = move4_equities.at[batch_idx, unique_first_move_4].max(move4_scores)
 
         double_equities = jnp.select(

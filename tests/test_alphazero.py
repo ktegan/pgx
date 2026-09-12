@@ -22,6 +22,7 @@ from pgx.backgammon import (
     ACTION_MOVE_LENGTH,
     ACTION_TOTAL_LENGTH,
     BackgammonTwoPlyStrategy,
+    OBSERVATION_SHAPE,
     SimpleBackgammonEvaluator,
     SimpleBackgammonEvaluatorConfig,
     _change_turn,
@@ -115,10 +116,12 @@ def test_recurrent_fn_discount_ignores_values_nodes_at_turn_end():
 
     # a turn-changing edge (NOOP at a no-move node) must still flip the sign
     import numpy
-    from pgx.backgammon import BAR_IDX, BOARD_DTYPE, _arr_legal_action_mask
+    from pgx.backgammon import (
+        ALL_GAME_POSITIONS, BAR_IDX, BOARD_DTYPE, PLAYER_CHECKERS, _arr_legal_action_mask
+    )
 
-    board = jnp.zeros(28, dtype=BOARD_DTYPE)
-    board = board.at[BAR_IDX].set(15)
+    board = jnp.zeros(ALL_GAME_POSITIONS, dtype=BOARD_DTYPE)
+    board = board.at[BAR_IDX].set(PLAYER_CHECKERS)
     for pos, cnt in zip(range(0, 6), [3, 3, 3, 2, 2, 2]):
         board = board.at[pos].set(-cnt)
     playable = jnp.array([2, 4, -1, -1], dtype=jnp.int32)
@@ -154,7 +157,7 @@ def test_td_lambda_targets_propagate_through_rolls_and_turns():
     compute_loss_input = make_compute_loss_input_fn(lambda r: r[..., jnp.newaxis], config)
 
     data = SelfplayOutput(
-        obs=jnp.zeros((1, max_num_steps, B, 24, 1, 12)),
+        obs=jnp.zeros((1, max_num_steps, B) + OBSERVATION_SHAPE),
         reward=jnp.tile(jnp.array([0.0, 0.0, 0.0, 1.0])[None, :, None], (1, 1, B)),
         terminated=jnp.tile(jnp.array([False, False, False, True])[None, :, None], (1, 1, B)),
         action_weights=jnp.zeros((1, max_num_steps, B, ACTION_TOTAL_LENGTH)),
@@ -218,7 +221,9 @@ def test_search_value_semantics():
     equity at move nodes, and 0 at chance and must-pass nodes (where the
     candidate boards are meaningless or absent)."""
     import numpy
-    from pgx.backgammon import BAR_IDX, BOARD_DTYPE, _arr_legal_action_mask
+    from pgx.backgammon import (
+        ALL_GAME_POSITIONS, BAR_IDX, BOARD_DTYPE, PLAYER_CHECKERS, _arr_legal_action_mask
+    )
 
     strategy = BackgammonTwoPlyStrategy(env)
     eval_cls = SimpleBackgammonEvaluator
@@ -238,8 +243,8 @@ def test_search_value_semantics():
     assert bool((numpy.asarray(search_value) == 0.0).all()), "chance nodes must report search_value 0"
 
     # must-pass nodes report 0
-    board = jnp.zeros(28, dtype=BOARD_DTYPE)
-    board = board.at[BAR_IDX].set(15)
+    board = jnp.zeros(ALL_GAME_POSITIONS, dtype=BOARD_DTYPE)
+    board = board.at[BAR_IDX].set(PLAYER_CHECKERS)
     for pos, cnt in zip(range(0, 6), [3, 3, 3, 2, 2, 2]):
         board = board.at[pos].set(-cnt)
     playable = jnp.array([2, 4, -1, -1], dtype=jnp.int32)

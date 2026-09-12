@@ -24,9 +24,15 @@ from pgx.backgammon import (
     ACTION_CHANCE_LENGTH,
     ACTION_MOVE_LENGTH,
     ACTION_TOTAL_LENGTH,
+    ALL_GAME_POSITIONS,
+    BAR_ENCODE_SCALE,
     BAR_IDX,
+    BOARD_LENGTH,
+    HOME_BOARD_LENGTH,
     NO_MOVE,
     NOOP_ACTION_IDX,
+    OFF_IDX,
+    PLAYER_CHECKERS,
     _arr_legal_action_mask_details,
     _arr_make_new_boards,
     _evaluate_boards,
@@ -915,13 +921,13 @@ def test_observe():
         exp_pts_neg1, exp_pts_neg2, exp_pts_le_neg3, exp_pts_neg_excess,
     ], axis=-1)
 
-    my_bar = jnp.abs(board[24]) / 2.0
-    opp_bar = jnp.abs(board[25]) / 2.0
-    my_off = jnp.abs(board[26]) / 15.0  # PLAYER_CHECKERS = 15
-    opp_off = jnp.abs(board[27]) / 15.0
+    my_bar = jnp.abs(board[BAR_IDX]) / BAR_ENCODE_SCALE
+    opp_bar = jnp.abs(board[BAR_IDX + 1]) / BAR_ENCODE_SCALE
+    my_off = jnp.abs(board[OFF_IDX]) / PLAYER_CHECKERS
+    opp_off = jnp.abs(board[OFF_IDX + 1]) / PLAYER_CHECKERS
 
     global_vec = jnp.array([my_bar, opp_bar, my_off, opp_off], dtype=jnp.float32)
-    global_features = jnp.tile(global_vec, (24, 1))
+    global_features = jnp.tile(global_vec, (BOARD_LENGTH, 1))
 
     expected_obs = jnp.concatenate([local_features, global_features], axis=-1)
     expected_obs = jnp.expand_dims(expected_obs, axis=1)
@@ -1140,17 +1146,18 @@ def test_is_all_on_home_board():
     board = _flip_board(board)
     assert not _arr_is_all_on_home_board(board)
 
-    board = jnp.zeros(28, dtype=BOARD_DTYPE).at[26].set(13)
-    assert not _arr_is_all_on_home_board(board.at[17].set(1))
-    assert     _arr_is_all_on_home_board(board.at[18].set(1))
-    assert not _arr_is_all_on_home_board(board.at[18].set(1).at[24].set(2))
+    board = jnp.zeros(ALL_GAME_POSITIONS, dtype=BOARD_DTYPE).at[OFF_IDX].set(13)
+    # checkers just outside the home board make bearing off illegal
+    assert not _arr_is_all_on_home_board(board.at[BOARD_LENGTH - HOME_BOARD_LENGTH - 1].set(1))
+    assert     _arr_is_all_on_home_board(board.at[BOARD_LENGTH - HOME_BOARD_LENGTH].set(1))
+    assert not _arr_is_all_on_home_board(board.at[BOARD_LENGTH - HOME_BOARD_LENGTH].set(1).at[BAR_IDX].set(2))
 
 
 def test_is_any_on_opponent_home_board():
-    board = jnp.zeros(28, dtype=BOARD_DTYPE).at[26].set(13)
-    assert     _arr_is_any_on_opponent_home_board(board.at[5].set(1))
-    assert not _arr_is_any_on_opponent_home_board(board.at[6].set(1))
-    assert     _arr_is_any_on_opponent_home_board(board.at[5].set(1).at[24].set(2))
+    board = jnp.zeros(ALL_GAME_POSITIONS, dtype=BOARD_DTYPE).at[OFF_IDX].set(13)
+    assert     _arr_is_any_on_opponent_home_board(board.at[HOME_BOARD_LENGTH - 1].set(1))
+    assert not _arr_is_any_on_opponent_home_board(board.at[HOME_BOARD_LENGTH].set(1))
+    assert     _arr_is_any_on_opponent_home_board(board.at[HOME_BOARD_LENGTH - 1].set(1).at[BAR_IDX].set(2))
 
 
 
@@ -1881,13 +1888,13 @@ def test_is_no_contact():
     assert not _is_no_contact(board_start)
 
     # Case 2: Contact is still possible (e.g. black has checker at 5, white at 8)
-    board_contact = jnp.zeros(28, dtype=BOARD_DTYPE)
+    board_contact = jnp.zeros(ALL_GAME_POSITIONS, dtype=BOARD_DTYPE)
     board_contact = board_contact.at[5].set(2)
     board_contact = board_contact.at[8].set(-2)
     assert not _is_no_contact(board_contact)
 
     # Case 3: No contact (black has checker at 12, white at 8. They have crossed paths)
-    board_no_contact = jnp.zeros(28, dtype=BOARD_DTYPE)
+    board_no_contact = jnp.zeros(ALL_GAME_POSITIONS, dtype=BOARD_DTYPE)
     board_no_contact = board_no_contact.at[12].set(2)
     board_no_contact = board_no_contact.at[8].set(-2)
     assert _is_no_contact(board_no_contact)
@@ -1896,8 +1903,8 @@ def test_is_no_contact():
     # If black has a checker on the bar (index 24, pos -1), and white has checkers on the board (e.g., at 0)
     # White's backmost checker is at 0. Black's backmost is -1.
     # -1 > 0 is False. So contact is still possible.
-    board_bar_black = jnp.zeros(28, dtype=BOARD_DTYPE)
-    board_bar_black = board_bar_black.at[24].set(1)  # black checker on bar
+    board_bar_black = jnp.zeros(ALL_GAME_POSITIONS, dtype=BOARD_DTYPE)
+    board_bar_black = board_bar_black.at[BAR_IDX].set(1)  # black checker on bar
     board_bar_black = board_bar_black.at[0].set(-1)  # white checker at 0
     assert not _is_no_contact(board_bar_black)
 
@@ -1912,7 +1919,7 @@ def test_strategy_chunked_vs_standard():
     # Setup some test states
     board_1 = jnp.array(START_POSITIONS, dtype=BOARD_DTYPE)
 
-    board_2 = jnp.zeros(28, dtype=BOARD_DTYPE)
+    board_2 = jnp.zeros(ALL_GAME_POSITIONS, dtype=BOARD_DTYPE)
     board_2 = board_2.at[5].set(2)
     board_2 = board_2.at[8].set(-2)
     board_2 = board_2.at[17].set(3)
@@ -2109,8 +2116,8 @@ def test_strategy_action_at_no_move_node():
     """At a no-move node the strategy must pass (NOOP) instead of returning an
     illegal candidate move."""
     B = 2
-    board = jnp.zeros(28, dtype=BOARD_DTYPE)
-    board = board.at[BAR_IDX].set(15)  # all black checkers on the bar
+    board = jnp.zeros(ALL_GAME_POSITIONS, dtype=BOARD_DTYPE)
+    board = board.at[BAR_IDX].set(PLAYER_CHECKERS)  # all black checkers on the bar
     for pos, cnt in zip(range(0, 6), [3, 3, 3, 2, 2, 2]):
         board = board.at[pos].set(-cnt)  # every entry point blocked by white
 
